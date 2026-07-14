@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -144,7 +144,14 @@ test("prompt injection starts session state and names the exact controller", () 
 
   assert.match(output.hookSpecificOutput.additionalContext, /node ['"]\/plugin\/scripts\/voltflow\.mjs['"]/);
   assert.match(output.hookSpecificOutput.additionalContext, /--session ['"]session-1['"]/);
+  assert.match(output.hookSpecificOutput.additionalContext, /external permission/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
+});
+
+test("subagent contract requires runtime evidence for changed observable layers", () => {
+  const output = handleHook(input("SubagentStart"));
+  assert.match(output.hookSpecificOutput.additionalContext, /every changed observable layer/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /syntax checks do not prove runtime behavior/i);
 });
 
 test("classification and a real RED precede production edits", () => {
@@ -711,6 +718,41 @@ test("editing a test invalidates prior RED evidence", () => {
   assert.equal(loadState(fx.dataDir, "session-1").red, null);
   const denied = handleHook(productionPatch(), fx.options);
   assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("test maintenance preserves observed RED for final review", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Fix behavior" }), fx.options);
+  start(fx);
+  failedTest(fx);
+  const legacy = loadState(fx.dataDir, "session-1");
+  delete legacy.redObserved;
+  const [stateFile] = readdirSync(path.join(fx.dataDir, "sessions"));
+  writeFileSync(path.join(fx.dataDir, "sessions", stateFile), JSON.stringify(legacy));
+  recordProductionEdit(fx);
+
+  fx.setFingerprint("diff-b");
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: test/app.test.mjs\n+cleanup\n*** End Patch" },
+      tool_response: "Success. Updated files.",
+    }),
+    fx.options,
+  );
+  passedTest(fx);
+
+  const state = loadState(fx.dataDir, "session-1");
+  assert.equal(state.red, null);
+  assert.ok(state.redObserved);
+  assert.equal(handleHook(productionPatch(), fx.options).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(
+    runController(
+      ["review", "--session", "session-1", "--lane", "composite"],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode,
+    0,
+  );
 });
 
 test("editing a test through the shell invalidates prior RED evidence", () => {

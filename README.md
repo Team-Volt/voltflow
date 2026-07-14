@@ -2,7 +2,7 @@
 
 VoltFlow is a Codex workflow plugin for teams that want TDD, small diffs, useful subagents, and a deployment gate without turning every change into a ceremony.
 
-It has one skill and one dependency-free Node hook. Session state lives in `PLUGIN_DATA`; it doesn't add ledgers or workflow files to the target repository.
+It has one skill and one dependency-free Node hook. Session state lives in protected `PLUGIN_DATA`; it doesn't add ledgers or workflow files to the target repository. If a sandboxed controller command cannot access that directory, rerun the exact command with external permission instead of moving approval state into the worktree or temporary storage.
 
 ## Install
 
@@ -19,7 +19,9 @@ Start a new Codex task, run `/hooks`, inspect the VoltFlow hook commands, and tr
 
 VoltFlow classifies work as `trivial`, `standard`, or `high`. Each tier has a minimum review mode: self-review for trivial work, one composite reviewer for standard work, and two independent lanes for high-risk work. An active workflow can be upgraded, but it cannot be downgraded to bypass its gate.
 
-Behavioral changes follow RED, GREEN, REFACTOR. The hook allows test edits before RED but blocks production edits until it has observed a failing test or the agent records a manual reproduction. It also detects file changes made through shell commands after they run, so changing the tool name does not bypass evidence invalidation. Only a successful, directly executed test command records automated validation. Prose, generated output, and metadata-only work use `tdd=exempt` with the closest useful validation.
+Behavioral changes follow RED, GREEN, REFACTOR. The hook allows test edits before RED but blocks production edits until it has observed a failing test or the agent records a manual reproduction. Later test edits clear the current production-edit authorization without erasing the fact that RED occurred, so final review does not demand a fake rerun against already-fixed code. It also detects file changes made through shell commands after they run, so changing the tool name does not bypass evidence invalidation. Only a successful, directly executed test command records automated validation. Prose, generated output, and metadata-only work use `tdd=exempt` with the closest useful validation.
+
+Validation must exercise each changed observable layer. Syntax checks cover syntax only; user-facing web changes need one real browser interaction at a supported viewport, or the final result must mark browser behavior as unverified.
 
 Review receipts use one-time lane assignments and are tied to a Git fingerprint containing HEAD, staged and unstaged diffs, untracked-file content, executable mode bits, and configured ignored inputs. A failed lane or later edit invalidates earlier passes. If Git cannot produce a complete fingerprint, the gate fails closed instead of reusing a partial value.
 

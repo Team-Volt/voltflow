@@ -31,7 +31,7 @@ For behavioral work:
 
 Before writing, name the owned paths and expected observable. Do not perform adjacent cleanup, introduce a dependency that the standard library or platform replaces, or add an abstraction with one foreseeable implementation. Re-read the diff after each slice and remove code that does not serve an acceptance criterion.
 
-Record successful automated or manual validation with the controller. A passing command from before the final edit is stale evidence.
+Record successful automated or manual validation with the controller. A passing command from before the final edit is stale evidence. Exercise every changed observable layer: a syntax check proves syntax, not browser behavior. When user-facing web files change, run one real browser path at a supported viewport, or report that claim as pending when no browser runtime is available.
 
 ## Delegate only useful parallel work
 
