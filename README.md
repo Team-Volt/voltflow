@@ -9,11 +9,11 @@ It has one skill and one dependency-free Node hook. Session state lives in `PLUG
 VoltFlow requires Node 20 or newer and Git. Add the Team Volt marketplace, then install the plugin:
 
 ```sh
-codex plugin marketplace add team-volt/voltflow
+codex plugin marketplace add Team-Volt/voltflow
 codex plugin add voltflow@team-volt
 ```
 
-The repository is private, so Git must be authenticated with an account that can access `team-volt/voltflow`. Start a new Codex task, run `/hooks`, inspect the VoltFlow hook commands, and trust them. A new task is required for Codex to load the installed skill and hooks.
+Start a new Codex task, run `/hooks`, inspect the VoltFlow hook commands, and trust them. A new task is required for Codex to load the installed skill and hooks.
 
 ## What it enforces
 
@@ -117,3 +117,7 @@ Incomplete workflow evidence never replaces the answer Codex already wrote. The 
 ```sh
 npm test
 ```
+
+## License
+
+[MIT](LICENSE)
