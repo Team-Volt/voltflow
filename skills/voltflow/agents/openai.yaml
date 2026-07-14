@@ -1,4 +1,4 @@
 interface:
   display_name: "VoltFlow"
-  short_description: "Lean TDD workflow and review gates"
-  default_prompt: "Use $voltflow to implement this change with proportional planning, tests, and review."
+  short_description: "Per-slice TDD and review gates"
+  default_prompt: "Use $voltflow to implement this change with proportional validation and review. Apply one focused failing test per behavior slice only when TDD is required; otherwise use the closest useful validation."
