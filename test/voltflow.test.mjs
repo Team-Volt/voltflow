@@ -159,6 +159,26 @@ test("subagent contract limits per-slice TDD to required work", () => {
   assert.match(output.hookSpecificOutput.additionalContext, /syntax checks do not prove runtime behavior/i);
 });
 
+test("active v2 spawns require isolated context", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement the parser" }), fx.options);
+  const spawn = (toolInput) => handleHook(
+    input("PreToolUse", { tool_name: "agentsspawn_agent", tool_input: toolInput }),
+    fx.options,
+  );
+
+  assert.equal(spawn({ task_name: "worker", message: "work", fork_turns: "all" }).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(spawn({ task_name: "worker", message: "work" }).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(spawn({ task_name: "worker", message: "work", fork_turns: "none" }), null);
+  assert.equal(handleHook(
+    input("PreToolUse", {
+      tool_name: "multi_agent_v1.spawn_agent",
+      tool_input: { message: "work", fork_context: false },
+    }),
+    fx.options,
+  ), null);
+});
+
 test("classification and a real RED precede production edits", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);

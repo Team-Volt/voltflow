@@ -36,3 +36,5 @@ The hook workflow observes subagent lifecycle events rather than calling either 
 Review prompts name the supported boundary, materiality threshold, and stop rule. Require reviewers to batch ordinary-use blockers in one pass. Do not ask them to enumerate every syntactic variant; when a finding family would require a full parser or control over an unavailable host boundary, document the limit and evaluate the authoritative fallback instead of continuing variant-by-variant patches.
 
 Do not spawn an agent when the main agent's next action depends immediately on its result, when the assignment is smaller than the handoff, or when two workers would touch the same file.
+
+After spawning, continue independent parent work. When none remains, use one bounded wait instead of repeated short polls; after two unchanged waits, send one scope-reducing follow-up, then interrupt only when the agent is blocking completion and has exceeded its stated stop condition.
