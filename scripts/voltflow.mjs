@@ -136,6 +136,7 @@ export function runController(argv, options = {}) {
       tddViolation: false,
       violationBaseFingerprint: null,
       red: null,
+      redObserved: null,
       validation: null,
       reviewAssignments: [],
       reviewPasses: [],
@@ -156,6 +157,7 @@ export function runController(argv, options = {}) {
     if (state.tddViolation === true) return failure("production changed before RED; revert that edit before recording evidence");
     if (!textFlag(flags.evidence)) return failure("red requires --evidence");
     state.red = evidence(flags.evidence, currentFingerprint);
+    state.redObserved = state.red;
     saveState(dataDir, state);
     return success("VoltFlow RED recorded");
   }
@@ -307,6 +309,7 @@ function onUserPromptLocked(input, context) {
   const configNote = context.configError === null ? "" : ` Config warning: ${context.configError}`;
   return userContext(
     `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
+      `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
       `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>.${configNote}`,
   );
@@ -398,12 +401,18 @@ function onPostToolUseLocked(input, context) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
     }
-    if (touchesTest) state.red = null;
+    if (touchesTest) {
+      state.redObserved ??= state.red;
+      state.red = null;
+    }
     invalidateForChange(state);
   }
 
   if (command !== null && isTestCommand(command)) {
-    if (failed && state.tdd === "required" && state.tddViolation !== true) state.red = evidence(command, current);
+    if (failed && state.tdd === "required" && state.tddViolation !== true) {
+      state.red = evidence(command, current);
+      state.redObserved = state.red;
+    }
     if (!failed && current !== null) state.validation = evidence(command, current);
   }
   if (current !== null) state.lastFingerprint = current;
@@ -417,7 +426,7 @@ function onSubagentStart() {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        "VoltFlow subtask contract: stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope, then end with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when no blocking finding remains; otherwise use FAIL with the same lane and token after the findings.",
+        "VoltFlow subtask contract: stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope, then end with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when no blocking finding remains; otherwise use FAIL with the same lane and token after the findings.",
     },
   };
 }
@@ -528,6 +537,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     tddViolation: false,
     violationBaseFingerprint: null,
     red: null,
+    redObserved: null,
     validation: null,
     reviewAssignments: [],
     reviewPasses: [],
@@ -556,7 +566,7 @@ function gateStatus(state, currentFingerprint) {
 function pendingReasons(state, currentFingerprint) {
   const reasons = [];
   if (!validClassification(state)) reasons.push("classification missing or weaker than the selected tier");
-  if (state.tdd === "required" && state.red === null) reasons.push("RED evidence missing");
+  if (state.tdd === "required" && historicalRed(state) === null) reasons.push("RED evidence missing");
   if (state.tddViolation === true) reasons.push("production changed before RED");
   if (state.validation?.fingerprint !== currentFingerprint) reasons.push("fresh validation missing");
   if (state.approval?.fingerprint !== currentFingerprint) reasons.push("final review missing or stale");
@@ -565,7 +575,7 @@ function pendingReasons(state, currentFingerprint) {
 
 function evidenceBlocker(state, currentFingerprint) {
   if (state.tddViolation === true) return "production changed before RED";
-  if (state.tdd === "required" && state.red === null) return "RED evidence is missing";
+  if (state.tdd === "required" && historicalRed(state) === null) return "RED evidence is missing";
   if (state.validation?.fingerprint !== currentFingerprint) return "fresh validation is missing";
   return null;
 }
@@ -624,6 +634,7 @@ function validState(value, sessionId) {
     && (value.lastFingerprint === null || typeof value.lastFingerprint === "string")
     && (value.violationBaseFingerprint === null || typeof value.violationBaseFingerprint === "string")
     && (value.red === null || validEvidence(value.red))
+    && (value.redObserved === undefined || value.redObserved === null || validEvidence(value.redObserved))
     && (value.validation === null || validEvidence(value.validation))
     && Array.isArray(value.reviewAssignments)
     && value.reviewAssignments.every(validReviewAssignment)
@@ -882,6 +893,10 @@ function approval(fingerprint, source, details) {
 
 function evidence(details, fingerprint) {
   return { details, fingerprint, at: timestamp() };
+}
+
+function historicalRed(state) {
+  return state.redObserved ?? state.red;
 }
 
 function quote(value) {
