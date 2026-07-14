@@ -21,15 +21,19 @@ Classify TDD as `required` for observable behavior and `exempt` for prose, gener
 
 Start the controller with `review=self` for trivial, `review=single` for standard, and `review=split` for high. Upgrade when discovery reveals more risk; do not downgrade to avoid a gate.
 
-## Execute the smallest proof
+## Execute required TDD one behavior at a time
 
-For behavioral work:
+When TDD is required, turn the acceptance criteria into ordered behavior slices before production code. Each slice is one observable behavior that one focused test can prove. Do not batch several tests before implementation or implement behavior reserved for a later slice.
 
-1. Add or run the narrowest faithful test or reproduction and observe it fail for the expected reason. The hook records failed test commands; use the controller's `red` command only when the proof is manual.
-2. Make the smallest production edit that turns the proof green.
-3. Refactor only when it removes duplication or complexity introduced or exposed by the change, then rerun the proof.
+Complete this loop for every TDD-required slice:
 
-Before writing, name the owned paths and expected observable. Do not perform adjacent cleanup, introduce a dependency that the standard library or platform replaces, or add an abstraction with one foreseeable implementation. Re-read the diff after each slice and remove code that does not serve an acceptance criterion.
+1. **RED:** Write one narrow behavioral test against real code, using mocks only at an unavoidable boundary. Run it and confirm that its assertion fails for the expected missing behavior. A passing test or setup error is not RED. The hook records failed test commands; use the controller's `red` command only when no runnable test seam exists.
+2. **GREEN:** Make the smallest production edit that passes this test and no later slice. If production code preceded its test, revert that production edit and restart the slice; do not retain it as a reference.
+3. **VERIFY:** Rerun the focused test and the smallest relevant regression set. Fix production code when the test remains valid; do not weaken the test to obtain GREEN.
+4. **REFACTOR:** Only after GREEN, remove duplication or complexity introduced or exposed by this slice, then rerun the same checks.
+5. **NEXT:** Re-read the slice diff, remove anything that does not serve its acceptance criterion, then start the next slice with its next failing test.
+
+Before writing, name the owned paths and expected observable. Do not perform adjacent cleanup, introduce a dependency that the standard library or platform replaces, or add an abstraction with one foreseeable implementation.
 
 Record successful automated or manual validation with the controller. A passing command from before the final edit is stale evidence. Exercise every changed observable layer: a syntax check proves syntax, not browser behavior. When user-facing web files change, run one real browser path at a supported viewport, or report that claim as pending when no browser runtime is available.
 

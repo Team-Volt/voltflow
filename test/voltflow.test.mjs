@@ -148,8 +148,13 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
-test("subagent contract requires runtime evidence for changed observable layers", () => {
+test("subagent contract limits per-slice TDD to required work", () => {
   const output = handleHook(input("SubagentStart"));
+  assert.match(output.hookSpecificOutput.additionalContext, /when TDD is required/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /one behavior/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /one focused test/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /finish RED.*GREEN before starting the next slice/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /TDD-exempt work.*do not create tests/i);
   assert.match(output.hookSpecificOutput.additionalContext, /every changed observable layer/i);
   assert.match(output.hookSpecificOutput.additionalContext, /syntax checks do not prove runtime behavior/i);
 });

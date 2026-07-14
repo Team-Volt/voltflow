@@ -426,7 +426,7 @@ function onSubagentStart() {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        "VoltFlow subtask contract: stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope, then end with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when no blocking finding remains; otherwise use FAIL with the same lane and token after the findings.",
+        "VoltFlow subtask contract: stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope, then end with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when no blocking finding remains; otherwise use FAIL with the same lane and token after the findings.",
     },
   };
 }
