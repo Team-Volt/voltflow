@@ -1,0 +1,22 @@
+{
+  "name": "voltflow",
+  "version": "0.1.1",
+  "description": "Adaptive TDD, surgical editing, subagent routing, and deployment review gates for Codex.",
+  "author": {
+    "name": "VoltFlow contributors"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "VoltFlow",
+    "shortDescription": "Lean TDD workflow and review gates.",
+    "longDescription": "VoltFlow scales planning, testing, delegation, and adversarial review to the risk of the change, then guards deployment with a diff-bound review receipt.",
+    "developerName": "VoltFlow contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Write"],
+    "defaultPrompt": [
+      "Implement this change with VoltFlow.",
+      "Review this change with VoltFlow.",
+      "Prepare this project for deployment with VoltFlow."
+    ]
+  }
+}

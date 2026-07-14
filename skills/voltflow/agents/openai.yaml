@@ -1,0 +1,4 @@
+interface:
+  display_name: "VoltFlow"
+  short_description: "Lean TDD workflow and review gates"
+  default_prompt: "Use $voltflow to implement this change with proportional planning, tests, and review."
