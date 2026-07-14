@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -843,6 +843,32 @@ test("controller state cannot cross repository roots", () => {
     { ...fx.options, cwd: "/repo-b" },
   );
   assert.equal(result.exitCode, 1);
+});
+
+test("controller recognizes symlink aliases for the same workspace", () => {
+  const fx = fixture();
+  const other = fixture();
+  const alias = `${fx.root}-alias`;
+  symlinkSync(fx.root, alias, "dir");
+  const started = runController(
+    ["start", "--session", "aliased", "--tier", "standard", "--tdd", "exempt", "--review", "single"],
+    { ...fx.options, cwd: alias },
+  );
+  assert.equal(started.exitCode, 0, started.stderr);
+
+  const status = runController(
+    ["status", "--session", "aliased"],
+    { ...fx.options, cwd: fx.root },
+  );
+  assert.equal(status.exitCode, 0, status.stderr);
+
+  unlinkSync(alias);
+  symlinkSync(other.root, alias, "dir");
+  const retargeted = runController(
+    ["status", "--session", "aliased"],
+    { ...fx.options, cwd: alias },
+  );
+  assert.equal(retargeted.exitCode, 1);
 });
 
 test("quoted override language does not arm deployment", () => {

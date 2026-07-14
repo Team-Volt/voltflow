@@ -9,6 +9,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -518,7 +519,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
   return {
     version: 1,
     sessionId,
-    cwd,
+    cwd: canonicalWorkspacePath(cwd),
     active: true,
     tier: "unclassified",
     tdd: "unclassified",
@@ -905,7 +906,18 @@ function validClassification(state) {
 }
 
 function sameWorkspace(left, right) {
-  return typeof left === "string" && typeof right === "string" && path.resolve(left) === path.resolve(right);
+  return typeof left === "string"
+    && typeof right === "string"
+    && canonicalWorkspacePath(left) === canonicalWorkspacePath(right);
+}
+
+function canonicalWorkspacePath(value) {
+  const resolved = path.resolve(value);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 function recoverRevertedViolation(state, currentFingerprint) {
