@@ -330,6 +330,15 @@ function onPreToolUse(input, context) {
   if (context.configError !== null && isCommandTool(input.tool_name)) {
     return deny(`VoltFlow configuration must be fixed before command execution: ${context.configError}`);
   }
+  if (
+    state?.active === true
+    && input.tool_name.endsWith("spawn_agent")
+    && isRecord(input.tool_input)
+    && typeof input.tool_input.task_name === "string"
+    && input.tool_input.fork_turns !== "none"
+  ) {
+    return deny('VoltFlow requires v2 subagents to use fork_turns: "none".');
+  }
 
   if (isDeployInvocation(input.tool_name, input.tool_input, input.cwd)) {
     if (state === null) return deny("VoltFlow blocked deployment: no workflow state or review receipt exists.");
