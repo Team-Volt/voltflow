@@ -6,47 +6,14 @@ It has one skill and one dependency-free Node hook. Session state lives in `PLUG
 
 ## Install
 
-VoltFlow requires Node 20 or newer and Git. Codex installs plugins from marketplaces, so place this repository at `plugins/voltflow` inside a local marketplace root:
-
-```text
-marketplace-root/
-├── .agents/plugins/marketplace.json
-└── plugins/voltflow/
-```
-
-Create `marketplace-root/.agents/plugins/marketplace.json`:
-
-```json
-{
-  "name": "voltflow-local",
-  "interface": {
-    "displayName": "VoltFlow Local"
-  },
-  "plugins": [
-    {
-      "name": "voltflow",
-      "source": {
-        "source": "local",
-        "path": "./plugins/voltflow"
-      },
-      "policy": {
-        "installation": "AVAILABLE",
-        "authentication": "ON_INSTALL"
-      },
-      "category": "Productivity"
-    }
-  ]
-}
-```
-
-Register the marketplace and install the plugin:
+VoltFlow requires Node 20 or newer and Git. Add the Team Volt marketplace, then install the plugin:
 
 ```sh
-codex plugin marketplace add /absolute/path/to/marketplace-root
-codex plugin add voltflow@voltflow-local
+codex plugin marketplace add team-volt/voltflow
+codex plugin add voltflow@team-volt
 ```
 
-Start a new Codex task, run `/hooks`, inspect the VoltFlow hook commands, and trust them. A new task is required for Codex to load the installed skill and hooks.
+The repository is private, so Git must be authenticated with an account that can access `team-volt/voltflow`. Start a new Codex task, run `/hooks`, inspect the VoltFlow hook commands, and trust them. A new task is required for Codex to load the installed skill and hooks.
 
 ## What it enforces
 
