@@ -866,9 +866,10 @@ function compilePaths(value, root) {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
     throw new Error("fingerprintPaths must be an array of relative file paths");
   }
+  const normalizedRoot = path.resolve(root);
   for (const entry of value) {
-    const resolved = path.resolve(root, entry);
-    if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+    const resolved = path.resolve(normalizedRoot, entry);
+    if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) {
       throw new Error("fingerprintPaths entries must stay inside the Git worktree");
     }
   }
@@ -876,8 +877,9 @@ function compilePaths(value, root) {
 }
 
 function hashWorkspacePath(hash, root, relativePath, allowMissing = false) {
-  const resolved = path.resolve(root, relativePath);
-  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) return false;
+  const normalizedRoot = path.resolve(root);
+  const resolved = path.resolve(normalizedRoot, relativePath);
+  if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) return false;
   hashField(hash, "path", relativePath);
   if (!existsSync(resolved)) {
     if (!allowMissing) return false;
@@ -886,7 +888,7 @@ function hashWorkspacePath(hash, root, relativePath, allowMissing = false) {
   }
   const stats = lstatSync(resolved);
   if (stats.isDirectory()) return false;
-  const object = git(root, ["hash-object", "--no-filters", "--", relativePath]);
+  const object = git(normalizedRoot, ["hash-object", "--no-filters", "--", relativePath]);
   if (!object.ok) return false;
   hashField(hash, "mode", String(stats.mode));
   hashField(hash, "object", object.stdout);

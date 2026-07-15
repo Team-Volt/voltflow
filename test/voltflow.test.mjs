@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -143,7 +144,7 @@ test("prompt injection starts session state and names the exact controller", () 
     fx.options,
   );
 
-  assert.match(output.hookSpecificOutput.additionalContext, /node ['"]\/plugin\/scripts\/voltflow\.mjs['"]/);
+  assert.match(output.hookSpecificOutput.additionalContext, /node ['"][^'"]*plugin[\\/]scripts[\\/]voltflow\.mjs['"]/);
   assert.match(output.hookSpecificOutput.additionalContext, /--session ['"]session-1['"]/);
   assert.match(output.hookSpecificOutput.additionalContext, /external permission/i);
   assert.match(output.hookSpecificOutput.additionalContext, /theoretical edge cases are advisory/i);
@@ -983,11 +984,19 @@ test("controller state cannot cross repository roots", () => {
   assert.equal(result.exitCode, 1);
 });
 
-test("controller recognizes symlink aliases for the same workspace", () => {
+test("controller recognizes symlink aliases for the same workspace", (t) => {
   const fx = fixture();
   const other = fixture();
   const alias = `${fx.root}-alias`;
-  symlinkSync(fx.root, alias, "dir");
+  try {
+    symlinkSync(fx.root, alias, "dir");
+  } catch (error) {
+    if (error?.code === "EPERM" || error?.code === "EACCES" || error?.code === "ENOSYS") {
+      t.skip(`symlinks unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
   const started = runController(
     ["start", "--session", "aliased", "--tier", "standard", "--tdd", "exempt", "--review", "single"],
     { ...fx.options, cwd: alias },
@@ -1020,7 +1029,7 @@ test("quoted override language does not arm deployment", () => {
   assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /override armed/i);
 });
 
-test("fingerprints distinguish large changes and untracked executable modes", () => {
+test("fingerprints distinguish large changes and untracked executable modes", (t) => {
   const root = mkdtempSync(path.join(tmpdir(), "voltflow-fingerprint-"));
   git(root, "init", "-q");
   git(root, "config", "user.email", "qa@example.com");
@@ -1035,6 +1044,11 @@ test("fingerprints distinguish large changes and untracked executable modes", ()
   const second = workspaceFingerprint(root);
   assert.equal(first, null);
   assert.equal(second, null);
+
+  if (process.platform === "win32") {
+    t.skip("Windows does not preserve executable mode changes with chmodSync");
+    return;
+  }
 
   const modeRoot = mkdtempSync(path.join(tmpdir(), "voltflow-mode-"));
   git(modeRoot, "init", "-q");
@@ -1076,7 +1090,7 @@ test("fingerprints frame untracked path fields unambiguously", () => {
   writeFileSync(secondPath, "same");
   const twoFiles = workspaceFingerprint(root);
   const mode = String(lstatSync(firstPath).mode);
-  const object = git(root, "hash-object", "--no-filters", "--", "a");
+  const object = git(root, "hash-object", "--no-filters", "--", "a").trim();
   unlinkSync(firstPath);
   unlinkSync(secondPath);
   writeFileSync(path.join(root, `a${mode}${object}b`), "same");
@@ -1126,10 +1140,10 @@ function git(root, ...args) {
 
 function hookProcess(cwd, dataDir, payload) {
   return new Promise((resolve, reject) => {
-    const entry = new URL("../scripts/voltflow.mjs", import.meta.url);
-    const child = spawn(process.execPath, [entry.pathname, "hook"], {
+    const entryPath = fileURLToPath(new URL("../scripts/voltflow.mjs", import.meta.url));
+    const child = spawn(process.execPath, [entryPath, "hook"], {
       cwd,
-      env: { ...process.env, PLUGIN_DATA: dataDir, PLUGIN_ROOT: path.dirname(path.dirname(entry.pathname)) },
+      env: { ...process.env, PLUGIN_DATA: dataDir, PLUGIN_ROOT: path.dirname(path.dirname(entryPath)) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stderr = "";
