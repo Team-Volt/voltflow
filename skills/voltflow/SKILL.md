@@ -55,6 +55,12 @@ Each spawn prompt contains five labeled fields and nothing repetitive:
 
 Treat examples as examples, not hidden requirements. When instructions conflict, follow the user outcome, repository invariants, and the bounded assignment in that order. Return a concise result with evidence; do not invent neighboring work to make the assignment look complete.
 
+## Monitor whole-session cost honestly
+
+Run the injected `report` command after discovery, before independent review, and at finish. It is a proxy ledger, not a token meter: it records visible prompt bytes, tool input/output byte totals by category, requested agent profiles and handoff bytes, validation activity, and review waves. It never stores prompt, tool, or reviewer content, and it cannot see hidden reasoning, billing, quota, or actual provider token usage.
+
+Use the report to remove avoidable repetition: narrow discovery output, keep delegations to one bounded outcome, batch related fixes before a review wave, and use split review only for high-risk work. Do not claim that requested subagent profiles are verified runtime billing telemetry.
+
 ## Review in proportion to risk
 
 Review the final diff against the request, not against an imagined ideal rewrite. Cover correctness, regression risk, relevant security boundaries, validation quality, and unnecessary scope.

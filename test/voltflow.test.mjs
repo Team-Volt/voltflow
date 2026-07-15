@@ -486,7 +486,7 @@ test("an unfinished workflow reactivates when the user says continue", () => {
 test("controller help lists the workflow commands", () => {
   const result = runController(["--help"]);
   assert.equal(result.exitCode, 0);
-  assert.match(result.stdout, /start\|skip\|red\|validate\|review\|approve\|status\|cost\|gate/);
+  assert.match(result.stdout, /start\|skip\|red\|validate\|review\|approve\|status\|cost\|report\|gate/);
 });
 
 test("cost report plans Terra high reviews and records review-round pressure", () => {
@@ -518,6 +518,51 @@ test("cost report plans Terra high reviews and records review-round pressure", (
   assert.equal(report.observed.reviewAssignments, 1);
   assert.equal(report.observed.reviewPasses, 0);
   assert.equal(report.likelyDrivers[0], "A pending independent review is active.");
+});
+
+test("session report tracks metadata-only whole-session cost proxies", () => {
+  const fx = fixture();
+  const secret = "do-not-persist-this-content";
+  handleHook(
+    input("UserPromptSubmit", { prompt: `Investigate ${secret}`, model: "gpt-5.6-terra" }),
+    fx.options,
+  );
+  start(fx, { tier: "standard", tdd: "exempt", review: "single" });
+
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "mcp__codebase_memory_mcp__search_graph",
+      tool_input: { query: "Asset" },
+      tool_response: { output: "matched symbol" },
+    }),
+    fx.options,
+  );
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "agentsspawn_agent",
+      tool_input: {
+        task_name: "reviewer",
+        message: `WORK LAYER: review ${secret}`,
+        fork_turns: "none",
+        model: "gpt-5.6-terra",
+        reasoning_effort: "high",
+      },
+      tool_response: { agent_id: "agent-1" },
+    }),
+    fx.options,
+  );
+
+  const result = runController(["report", "--session", "session-1"], { ...fx.options, cwd: "/repo" });
+  assert.equal(result.exitCode, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.exactTokenTelemetry, "unavailable");
+  assert.equal(report.parentModel.observed["gpt-5.6-terra"], 1);
+  assert.ok(report.visiblePrompt.bytes > 0);
+  assert.equal(report.toolContext.categories.discovery.calls, 1);
+  assert.equal(report.delegation.requestedProfiles["gpt-5.6-terra:high"], 1);
+  assert.equal(report.delegation.handoffBytes > 0, true);
+  assert.equal(JSON.stringify(report).includes(secret), false);
+  assert.equal(JSON.stringify(loadState(fx.dataDir, "session-1")).includes(secret), false);
 });
 
 test("routine review agents require Terra high unless a named Sol exception applies", () => {

@@ -93,6 +93,9 @@ node <plugin-root>/scripts/voltflow.mjs validate \
 node <plugin-root>/scripts/voltflow.mjs cost \
   --data-dir <plugin-data> --session <session-id>
 
+node <plugin-root>/scripts/voltflow.mjs report \
+  --data-dir <plugin-data> --session <session-id>
+
 node <plugin-root>/scripts/voltflow.mjs review \
   --data-dir <plugin-data> --session <session-id> \
   --lane composite
@@ -107,7 +110,9 @@ node <plugin-root>/scripts/voltflow.mjs gate \
 
 Give the token returned by `review` to that reviewer. Its final line must be `VOLTFLOW_REVIEW: PASS <lane> <token>` or `VOLTFLOW_REVIEW: FAIL <lane> <token>`.
 
-`cost` reports the planned routine-review profile, current review-round pressure, and likely usage drivers. It does not report exact tokens because the Codex session telemetry does not expose them to the plugin.
+`cost` reports the planned routine-review profile, current review-round pressure, and likely usage drivers. `report` adds whole-session proxies: observed parent model metadata, visible prompt size, tool input/output byte totals grouped by category, requested subagent profiles and handoff size, test/validation activity, and review waves. Run it after discovery, before review, and at finish.
+
+Neither command reports exact tokens, billing, quota, or hidden reasoning usage because the Codex session telemetry does not expose those values to the plugin. VoltFlow persists counts and byte sizes only; it does not persist prompt, tool, or reviewer content for this report.
 
 Put the final `gate` command immediately before the provider's deploy command in the same local session or deploy wrapper. Plugin hooks are useful guardrails, but `PreToolUse` cannot intercept every possible side effect. VoltFlow does not yet provide a portable signed receipt for a separate remote CI machine, so do not describe the local state file as an authoritative remote boundary.
 
