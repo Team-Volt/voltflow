@@ -6,8 +6,8 @@ Use the smallest profile that clears the task. These profiles seed VoltFlow's ro
 | --- | --- |
 | `gpt-5.6-luna`, `high` | Read-heavy discovery, focused test execution, mechanical edits, and simple pattern-following work. |
 | `gpt-5.6-terra`, `max` | Standard implementation inside established architecture and bounded multi-file changes. |
-| `gpt-5.6-sol`, `medium` | Planning, integration, and composite review that need global coherence without max-cost reasoning. |
-| `gpt-5.6-sol`, `high` | Routine adversarial review, correctness checks, and bounded security review without a named high-risk boundary. |
+| `gpt-5.6-terra`, `high` | Routine independent review, adversarial correctness checks, and bounded security review without a named high-risk boundary. |
+| `gpt-5.6-sol`, `medium` | Planning and integration that need global coherence without max-cost reasoning. |
 | `gpt-5.6-sol`, `max` | High-risk architecture, security, concurrency, migrations, and ambiguous work where a missed constraint is expensive. |
 
 ## Routing rules
@@ -15,7 +15,7 @@ Use the smallest profile that clears the task. These profiles seed VoltFlow's ro
 1. Choose by difficulty, not by role title. A mechanical security-file edit can use Luna; a subtle one-file race can require Sol max.
 2. Set `model` and `reasoning_effort` directly when the spawn schema exposes them. Omit `service_tier`.
 3. If only `agent_type` is available, select a profile that pins the required model and effort. If neither override surface exists, inherit the parent and state `routing degraded` once in the result.
-4. Use Sol medium for the normal planner and composite reviewer, and Sol high for routine independent review lanes. Raise to Sol max only for a named high-risk fact.
+4. Use Terra high for routine review-only agents. The controller requires it explicitly, so do not inherit the parent model. Use Sol only with a named high-risk exception (authorization, private data, payments, bookings, destructive/data-integrity migrations, or cross-cutting architecture) or when the user explicitly requests it.
 5. Size each wave to the useful independent slices and the host's available concurrency. Do not create slices solely to increase agent count.
 
 ## Spawn schema

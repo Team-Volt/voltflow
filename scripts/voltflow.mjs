@@ -50,7 +50,7 @@ const OVERRIDE_INTENT = /^\s*(?:(?:voltflow[:,]?\s+)?(?:please\s+)?(?:override|b
 const OVERRIDE_QUESTION = /^\s*(?:how|what|when|where|why|who|(?:can|could|should|would|do)\s+(?:i|we)|is\s+it)\b/i;
 const OVERRIDE_NEGATION = /\b(?:do\s+not|don't|dont|never)\s+(?:\w+\s+){0,2}(?:override|bypass|ignore|overrule|waive|deploy|release|ship)\b/i;
 const USAGE = [
-  "Usage: voltflow.mjs start|skip|red|validate|review|approve|status|gate --session <id>",
+  "Usage: voltflow.mjs start|skip|red|validate|review|approve|status|cost|gate --session <id>",
   "start: --tier trivial|standard|high --tdd required|exempt --review self|single|split",
   "skip: --evidence <reason> (simple work only, before any change)",
   "red|validate: --evidence <text>",
@@ -143,6 +143,7 @@ export function runController(argv, options = {}) {
       validation: null,
       reviewAssignments: [],
       reviewPasses: [],
+      reviewHistory: [],
       reviewFailure: null,
       approval: null,
       override: null,
@@ -207,6 +208,8 @@ export function runController(argv, options = {}) {
     const token = randomUUID();
     state.reviewAssignments = state.reviewAssignments.filter((entry) => entry.lane !== flags.lane);
     state.reviewAssignments.push({ lane: flags.lane, token, fingerprint: currentFingerprint, at: timestamp() });
+    state.reviewHistory ??= [];
+    state.reviewHistory.push({ lane: flags.lane, at: timestamp() });
     saveState(dataDir, state);
     return success(`VoltFlow review assigned: ${flags.lane} token=${token}`);
   }
@@ -226,6 +229,10 @@ export function runController(argv, options = {}) {
     return success(JSON.stringify(state, null, 2));
   }
 
+  if (command === "cost") {
+    return success(JSON.stringify(costReport(state), null, 2));
+  }
+
   if (command === "gate") {
     const current = fingerprint(cwd);
     const gate = gateStatus(state, current);
@@ -233,6 +240,39 @@ export function runController(argv, options = {}) {
   }
 
   return failure(USAGE);
+}
+
+function costReport(state) {
+  const reviewers = state.reviewMode === "single" ? 1 : state.reviewMode === "split" ? 2 : 0;
+  const reviewHistory = Array.isArray(state.reviewHistory) ? state.reviewHistory : [];
+  const likelyDrivers = [];
+  if (state.reviewAssignments.length > 0) likelyDrivers.push("A pending independent review is active.");
+  if (reviewHistory.length > reviewers && reviewers > 0) {
+    likelyDrivers.push("Repeated review assignments are likely increasing context and reasoning usage.");
+  }
+  if (state.reviewMode === "split") {
+    likelyDrivers.push("Split review doubles independent reviewer context by design.");
+  }
+  if (likelyDrivers.length === 0) likelyDrivers.push("No independent review activity is currently recorded.");
+
+  return {
+    exactTokenTelemetry: "unavailable",
+    forecast: {
+      routineReview: {
+        model: "gpt-5.6-terra",
+        reasoningEffort: "high",
+        reviewers,
+      },
+      costBand: reviewers === 0 ? "low" : reviewers === 1 ? "medium" : "high",
+      solEscalation: "Require an explicit high-risk reason or direct user request.",
+    },
+    observed: {
+      reviewAssignments: state.reviewAssignments.length,
+      reviewPasses: state.reviewPasses.length,
+      reviewRounds: reviewHistory.length,
+    },
+    likelyDrivers,
+  };
 }
 
 export function loadState(dataDir, sessionId) {
@@ -262,6 +302,22 @@ export function isDeployInvocation(toolName, toolInput, cwd) {
 
   if (/(?:^|__|\.)(?:deploy|publish|promote|rollout|release_create|create_release)(?:$|__|\.|_)/i.test(toolName)) return true;
   return false;
+}
+
+function routineReviewSpawnViolation(toolInput) {
+  const taskName = typeof toolInput.task_name === "string" ? toolInput.task_name : "";
+  const message = typeof toolInput.message === "string" ? toolInput.message : "";
+  const scope = `${taskName}\n${message}`;
+  if (!/(?:\b(?:review|reviewer|adversarial review|correctness-security|validation-scope|composite review)\b|WORK LAYER:\s*review\b)/i.test(scope)) {
+    return null;
+  }
+  if (toolInput.model === "gpt-5.6-sol" && namedSolReviewException(scope)) return null;
+  if (toolInput.model === "gpt-5.6-terra" && toolInput.reasoning_effort === "high") return null;
+  return "VoltFlow cost policy requires routine review agents to explicitly use model=gpt-5.6-terra and reasoning_effort=high. Sol review requires SOL_EXCEPTION with a named high-risk boundary or a direct user request.";
+}
+
+function namedSolReviewException(scope) {
+  return /SOL_EXCEPTION:\s*(?:direct user request|authorization|authentication|private data|private uploads?|payments?|refunds?|booking lifecycle|destructive migration|data[- ]integrity migration|cross[- ]cutting architecture)\b/i.test(scope);
 }
 
 export function workspaceFingerprint(cwd) {
@@ -339,11 +395,11 @@ function onUserPromptLocked(input, context) {
   const prefix = `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(input.session_id)}`;
   const configNote = context.configError === null ? "" : ` Config warning: ${context.configError}`;
   return userContext(
-    `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
+      `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
       `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
       `For a simple, low-risk edit with no deployment intent, replace start with skip and add --evidence <reason>; skip must happen before any change and does not approve deployment. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
-      `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
+      `Before an independent review, run ${prefix.replace("<command>", "cost")} for the forecast. Routine review agents must explicitly use gpt-5.6-terra at high reasoning; Sol needs a named high-risk exception or direct user request. Then replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
       `Completion bar: finish when current evidence shows the result is safe and satisfies the requested scope. Theoretical edge cases are advisory unless they are reproducible in ordinary documented use and break requested behavior, a repository invariant, or a material safety boundary. Do not reopen validated work for speculative improvement.${configNote}`,
   );
 }
@@ -371,6 +427,10 @@ function onPreToolUse(input, context) {
     && input.tool_input.fork_turns !== "none"
   ) {
     return deny('VoltFlow requires v2 subagents to use fork_turns: "none".');
+  }
+  if (state?.active === true && input.tool_name.endsWith("spawn_agent") && isRecord(input.tool_input)) {
+    const violation = routineReviewSpawnViolation(input.tool_input);
+    if (violation !== null) return deny(violation);
   }
 
   if (isDeployInvocation(input.tool_name, input.tool_input, input.cwd)) {
@@ -699,6 +759,7 @@ function validState(value, sessionId) {
     && value.reviewAssignments.every(validReviewAssignment)
     && Array.isArray(value.reviewPasses)
     && value.reviewPasses.every(validReviewPass)
+    && (value.reviewHistory === undefined || (Array.isArray(value.reviewHistory) && value.reviewHistory.every(validReviewHistoryEntry)))
     && (value.reviewFailure === null || (isRecord(value.reviewFailure) && typeof value.reviewFailure.lane === "string"))
     && (value.approval === null || validApproval(value.approval))
     && (value.override === null || validOverride(value.override))
@@ -725,6 +786,12 @@ function validReviewPass(value) {
     && typeof value.agentId === "string"
     && typeof value.lane === "string"
     && typeof value.fingerprint === "string"
+    && typeof value.at === "string";
+}
+
+function validReviewHistoryEntry(value) {
+  return isRecord(value)
+    && typeof value.lane === "string"
     && typeof value.at === "string";
 }
 

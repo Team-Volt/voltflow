@@ -149,6 +149,7 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /external permission/i);
   assert.match(output.hookSpecificOutput.additionalContext, /theoretical edge cases are advisory/i);
   assert.match(output.hookSpecificOutput.additionalContext, /safe and satisfies the requested scope/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /cost.*gpt-5\.6-terra.*high/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
@@ -485,7 +486,71 @@ test("an unfinished workflow reactivates when the user says continue", () => {
 test("controller help lists the workflow commands", () => {
   const result = runController(["--help"]);
   assert.equal(result.exitCode, 0);
-  assert.match(result.stdout, /start\|skip\|red\|validate\|review\|approve\|status\|gate/);
+  assert.match(result.stdout, /start\|skip\|red\|validate\|review\|approve\|status\|cost\|gate/);
+});
+
+test("cost report plans Terra high reviews and records review-round pressure", () => {
+  const fx = fixture();
+  start(fx, { tier: "standard", tdd: "exempt", review: "single" });
+
+  const initial = runController(["cost", "--session", "session-1"], { ...fx.options, cwd: "/repo" });
+  assert.equal(initial.exitCode, 0, initial.stderr);
+  const initialReport = JSON.parse(initial.stdout);
+  assert.equal(initialReport.exactTokenTelemetry, "unavailable");
+  assert.deepEqual(initialReport.forecast.routineReview, {
+    model: "gpt-5.6-terra",
+    reasoningEffort: "high",
+    reviewers: 1,
+  });
+
+  const validated = runController(
+    ["validate", "--session", "session-1", "--evidence", "closest relevant check passed"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(validated.exitCode, 0, validated.stderr);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(assigned.exitCode, 0, assigned.stderr);
+
+  const report = JSON.parse(runController(["cost", "--session", "session-1"], { ...fx.options, cwd: "/repo" }).stdout);
+  assert.equal(report.observed.reviewAssignments, 1);
+  assert.equal(report.observed.reviewPasses, 0);
+  assert.equal(report.likelyDrivers[0], "A pending independent review is active.");
+});
+
+test("routine review agents require Terra high unless a named Sol exception applies", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Review the parser" }), fx.options);
+  start(fx, { tier: "standard", tdd: "exempt", review: "single" });
+
+  const reviewSpawn = (model, reasoningEffort, message) => handleHook(
+    input("PreToolUse", {
+      tool_name: "agentsspawn_agent",
+      tool_input: {
+        task_name: "reviewer",
+        message,
+        fork_turns: "none",
+        model,
+        reasoning_effort: reasoningEffort,
+      },
+    }),
+    fx.options,
+  );
+
+  const denied = reviewSpawn("gpt-5.6-sol", "high", "WORK LAYER: review");
+  assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /gpt-5\.6-terra.*high/i);
+  assert.equal(reviewSpawn("gpt-5.6-terra", "high", "WORK LAYER: review"), null);
+  assert.equal(
+    reviewSpawn("gpt-5.6-sol", "high", "WORK LAYER: review\nSOL_EXCEPTION: authorization boundary"),
+    null,
+  );
+  assert.equal(
+    reviewSpawn("gpt-5.6-sol", "high", "WORK LAYER: review\nSOL_EXCEPTION: direct user request"),
+    null,
+  );
 });
 
 function productionPatchDecision(fx) {
