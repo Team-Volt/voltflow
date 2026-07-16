@@ -565,6 +565,20 @@ test("session report tracks metadata-only whole-session cost proxies", () => {
   assert.equal(JSON.stringify(loadState(fx.dataDir, "session-1")).includes(secret), false);
 });
 
+test("session report retains proxy metrics across completed turns", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "first turn", model: "gpt-5.6-terra" }), fx.options);
+  start(fx, { tier: "trivial", tdd: "exempt", review: "self" });
+  handleHook(input("Stop", { last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", { prompt: "second turn", model: "gpt-5.6-terra" }), fx.options);
+  const result = runController(["report", "--session", "session-1"], { ...fx.options, cwd: "/repo" });
+  assert.equal(result.exitCode, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.visiblePrompt.submissions, 2);
+  assert.equal(report.parentModel.observed["gpt-5.6-terra"], 2);
+});
+
 test("routine review agents require Terra high unless a named Sol exception applies", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Review the parser" }), fx.options);
