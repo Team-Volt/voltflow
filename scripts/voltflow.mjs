@@ -26,6 +26,8 @@ const SPLIT_LANES = new Set(["correctness-security", "validation-scope"]);
 const REVIEW_RANK = { self: 0, single: 1, split: 2 };
 const TIER_RANK = { trivial: 0, standard: 1, high: 2 };
 const REQUIRED_REVIEW = { trivial: "self", standard: "single", high: "split" };
+const VALUE_WARNING =
+  "VoltFlow value check: You have reopened a validated diff twice. Stop searching for further imperfections. Continue only for a concrete, reproducible, material blocker to the user's requested outcome, a repository invariant, or a safety boundary; otherwise validate the current change once and finish.";
 const DEFAULT_DEPLOY_PATTERNS = [
   /\b(?:npm|pnpm|yarn|bun)\b[^\n;&|]*\b(?:run\s+)?deploy\b/i,
   /\b(?:npm|pnpm|yarn|bun|cargo)\b[^\n;&|]*\bpublish\b/i,
@@ -147,6 +149,8 @@ export function runController(argv, options = {}) {
       skip: null,
       lastFingerprint: currentFingerprint,
       stopBlocks: 0,
+      reworkCycles: 0,
+      valueWarningIssued: false,
       updatedAt: timestamp(),
     });
     saveState(dataDir, state);
@@ -326,6 +330,8 @@ function onUserPromptLocked(input, context) {
   state.active = true;
   state.promptHash = createHash("sha256").update(input.prompt).digest("hex");
   state.stopBlocks = 0;
+  state.reworkCycles = 0;
+  state.valueWarningIssued = false;
   state.updatedAt = timestamp();
   saveState(context.dataDir, state);
 
@@ -337,7 +343,8 @@ function onUserPromptLocked(input, context) {
       `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
       `For a simple, low-risk edit with no deployment intent, replace start with skip and add --evidence <reason>; skip must happen before any change and does not approve deployment. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
-      `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>.${configNote}`,
+      `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
+      `Completion bar: finish when current evidence shows the result is safe and satisfies the requested scope. Theoretical edge cases are advisory unless they are reproducible in ordinary documented use and break requested behavior, a repository invariant, or a material safety boundary. Do not reopen validated work for speculative improvement.${configNote}`,
   );
 }
 
@@ -422,12 +429,24 @@ function onPostToolUseLocked(input, context) {
     ? commandFrom(input.tool_input)
     : null;
   const fingerprintChanged = current !== null && state.lastFingerprint !== null && current !== state.lastFingerprint;
+  let valueWarning = null;
   if ((!failed && editTool) || fingerprintChanged) {
     const paths = editedPaths(input.tool_input);
     const testOnlyEdit = editTool && paths.length > 0 && paths.every(isTestPath);
     const touchesTest = (editTool && paths.some(isTestPath)) || (command !== null && commandMentionsTestPath(command));
     const touchesProduction = (editTool && paths.some((file) => !isTestPath(file)))
       || (command !== null && commandMentionsProductionPath(command));
+    if (
+      state.validation?.fingerprint === state.lastFingerprint
+      && !testOnlyEdit
+      && (touchesProduction || (fingerprintChanged && command !== null))
+    ) {
+      state.reworkCycles = (state.reworkCycles ?? 0) + 1;
+      if (state.reworkCycles >= 2 && state.valueWarningIssued !== true) {
+        state.valueWarningIssued = true;
+        valueWarning = { systemMessage: VALUE_WARNING };
+      }
+    }
     if (state.tdd === "required" && state.red === null && state.tddViolation !== true && !testOnlyEdit && !recoveredViolation) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
@@ -453,7 +472,7 @@ function onPostToolUseLocked(input, context) {
   if (current !== null) state.lastFingerprint = current;
   state.updatedAt = timestamp();
   saveState(context.dataDir, state);
-  return null;
+  return valueWarning;
 }
 
 function onSubagentStart() {
@@ -461,7 +480,7 @@ function onSubagentStart() {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        "VoltFlow subtask contract: stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope, then end with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when no blocking finding remains; otherwise use FAIL with the same lane and token after the findings.",
+        "VoltFlow subtask contract: stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.",
     },
   };
 }
@@ -584,6 +603,8 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
         : null,
     skip: null,
     stopBlocks: 0,
+    reworkCycles: 0,
+    valueWarningIssued: false,
     lastFingerprint: currentFingerprint,
     createdAt: timestamp(),
     updatedAt: timestamp(),
@@ -664,6 +685,8 @@ function validState(value, sessionId) {
     && typeof value.active === "boolean"
     && typeof value.changed === "boolean"
     && typeof value.tddViolation === "boolean"
+    && (value.reworkCycles === undefined || Number.isInteger(value.reworkCycles))
+    && (value.valueWarningIssued === undefined || typeof value.valueWarningIssued === "boolean")
     && ["unclassified", ...TIERS].includes(value.tier)
     && ["unclassified", ...TDD_MODES].includes(value.tdd)
     && ["unclassified", ...REVIEW_MODES].includes(value.reviewMode)

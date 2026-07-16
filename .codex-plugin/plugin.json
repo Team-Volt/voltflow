@@ -1,6 +1,6 @@
 {
   "name": "voltflow",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Adaptive TDD, surgical editing, subagent routing, and deployment review gates for Codex.",
   "author": {
     "name": "VoltFlow contributors"
