@@ -50,7 +50,7 @@ const OVERRIDE_INTENT = /^\s*(?:(?:voltflow[:,]?\s+)?(?:please\s+)?(?:override|b
 const OVERRIDE_QUESTION = /^\s*(?:how|what|when|where|why|who|(?:can|could|should|would|do)\s+(?:i|we)|is\s+it)\b/i;
 const OVERRIDE_NEGATION = /\b(?:do\s+not|don't|dont|never)\s+(?:\w+\s+){0,2}(?:override|bypass|ignore|overrule|waive|deploy|release|ship)\b/i;
 const USAGE = [
-  "Usage: voltflow.mjs start|skip|red|validate|review|approve|status|gate --session <id>",
+  "Usage: voltflow.mjs start|skip|red|validate|review|approve|status|cost|report|gate --session <id>",
   "start: --tier trivial|standard|high --tdd required|exempt --review self|single|split",
   "skip: --evidence <reason> (simple work only, before any change)",
   "red|validate: --evidence <text>",
@@ -130,6 +130,7 @@ export function runController(argv, options = {}) {
       saveState(dataDir, state);
       return success(`VoltFlow updated: ${flags.tier}, tdd=${flags.tdd}, review=${flags.review}`);
     }
+    const sessionMetrics = state.active === true ? sessionMetricsFor(state) : freshSessionMetrics();
     Object.assign(state, {
       active: true,
       tier: flags.tier,
@@ -143,10 +144,12 @@ export function runController(argv, options = {}) {
       validation: null,
       reviewAssignments: [],
       reviewPasses: [],
+      reviewHistory: [],
       reviewFailure: null,
       approval: null,
       override: null,
       skip: null,
+      sessionMetrics,
       lastFingerprint: currentFingerprint,
       stopBlocks: 0,
       reworkCycles: 0,
@@ -195,6 +198,7 @@ export function runController(argv, options = {}) {
     if (!textFlag(flags.evidence)) return failure("validate requires --evidence");
     if (currentFingerprint === null) return failure("Git fingerprint unavailable");
     state.validation = evidence(flags.evidence, currentFingerprint);
+    sessionMetricsFor(state).workflow.validationRecords += 1;
     saveState(dataDir, state);
     return success("VoltFlow validation recorded");
   }
@@ -207,8 +211,10 @@ export function runController(argv, options = {}) {
     const token = randomUUID();
     state.reviewAssignments = state.reviewAssignments.filter((entry) => entry.lane !== flags.lane);
     state.reviewAssignments.push({ lane: flags.lane, token, fingerprint: currentFingerprint, at: timestamp() });
+    state.reviewHistory ??= [];
+    state.reviewHistory.push({ lane: flags.lane, at: timestamp() });
     saveState(dataDir, state);
-    return success(`VoltFlow review assigned: ${flags.lane} token=${token}`);
+    return success(`VoltFlow review assigned: ${flags.lane} token=${token}\nInclude VOLTFLOW_REVIEW_ASSIGNMENT: ${flags.lane} ${token} in the reviewer spawn prompt.`);
   }
 
   if (command === "approve") {
@@ -226,6 +232,14 @@ export function runController(argv, options = {}) {
     return success(JSON.stringify(state, null, 2));
   }
 
+  if (command === "cost") {
+    return success(JSON.stringify(costReport(state), null, 2));
+  }
+
+  if (command === "report") {
+    return success(JSON.stringify(sessionReport(state), null, 2));
+  }
+
   if (command === "gate") {
     const current = fingerprint(cwd);
     const gate = gateStatus(state, current);
@@ -233,6 +247,101 @@ export function runController(argv, options = {}) {
   }
 
   return failure(USAGE);
+}
+
+function costReport(state) {
+  const reviewers = state.reviewMode === "single" ? 1 : state.reviewMode === "split" ? 2 : 0;
+  const reviewHistory = Array.isArray(state.reviewHistory) ? state.reviewHistory : [];
+  const likelyDrivers = [];
+  if (state.reviewAssignments.length > 0) likelyDrivers.push("A pending independent review is active.");
+  if (reviewHistory.length > reviewers && reviewers > 0) {
+    likelyDrivers.push("Repeated review assignments are likely increasing context and reasoning usage.");
+  }
+  if (state.reviewMode === "split") {
+    likelyDrivers.push("Split review doubles independent reviewer context by design.");
+  }
+  if (likelyDrivers.length === 0) likelyDrivers.push("No independent review activity is currently recorded.");
+
+  return {
+    exactTokenTelemetry: "unavailable",
+    forecast: {
+      routineReview: {
+        model: "gpt-5.6-terra",
+        reasoningEffort: "high",
+        reviewers,
+      },
+      costBand: reviewers === 0 ? "low" : reviewers === 1 ? "medium" : "high",
+      solEscalation: "Require an explicit high-risk reason or direct user request.",
+    },
+    observed: {
+      reviewAssignments: state.reviewAssignments.length,
+      reviewPasses: state.reviewPasses.length,
+      reviewRounds: reviewHistory.length,
+    },
+    likelyDrivers,
+  };
+}
+
+function sessionReport(state) {
+  const metrics = sessionMetricsFor(state);
+  const reviewHistory = Array.isArray(state.reviewHistory) ? state.reviewHistory : [];
+  const likelyDrivers = [];
+  const recommendedImprovements = [];
+  const solRequests = Object.entries(metrics.delegation.requestedProfiles)
+    .filter(([profile]) => profile.startsWith("gpt-5.6-sol:"))
+    .reduce((total, [, count]) => total + count, 0);
+
+  if (metrics.delegation.spawnRequests > 0) {
+    likelyDrivers.push(`${metrics.delegation.spawnRequests} delegated agent request(s) added independent context and reasoning work.`);
+  }
+  if (state.reviewMode === "split") {
+    likelyDrivers.push("Split review uses two independent reviewer contexts by design.");
+    recommendedImprovements.push("Use split review only for high-risk work; use one composite Terra review when the selected tier permits it.");
+  }
+  if (reviewHistory.length > 2) {
+    likelyDrivers.push("Repeated review assignments are likely replaying change context.");
+    recommendedImprovements.push("Batch related fixes before requesting another review wave.");
+  }
+  if (metrics.toolContext.outputBytes > metrics.toolContext.inputBytes * 3 && metrics.toolContext.outputBytes > 50000) {
+    likelyDrivers.push("Large tool outputs are likely expanding visible working context.");
+    recommendedImprovements.push("Ask discovery and test commands for focused output, then inspect only the relevant files or failures.");
+  }
+  if (metrics.visiblePrompt.bytes > 20000) {
+    likelyDrivers.push("Long user prompts are contributing substantial visible context.");
+    recommendedImprovements.push("Move stable workflow rules into repository guidance and keep issue prompts to outcome, boundaries, gates, and stop conditions.");
+  }
+  if (solRequests > 0) {
+    likelyDrivers.push(`${solRequests} requested Sol delegation(s) may be a major usage driver.`);
+    recommendedImprovements.push("Reserve Sol delegations for named high-risk exceptions; default review and scoped delivery to Terra.");
+  }
+  if (likelyDrivers.length === 0) likelyDrivers.push("No material session cost proxy is recorded yet.");
+  if (recommendedImprovements.length === 0) recommendedImprovements.push("Keep delegation narrow and request this report at discovery, pre-review, and finish checkpoints.");
+
+  return {
+    exactTokenTelemetry: "unavailable",
+    limitations: "This report excludes hidden system, reasoning, billing, and quota telemetry. It stores counts and byte sizes only, never prompt, tool, or reviewer content.",
+    parentModel: {
+      observed: metrics.parentModels,
+      note: "Observed from user-prompt hook metadata; absent values are reported as unknown.",
+    },
+    visiblePrompt: metrics.visiblePrompt,
+    toolContext: metrics.toolContext,
+    delegation: {
+      ...metrics.delegation,
+      requestedProfiles: metrics.delegation.requestedProfiles,
+      note: "Profiles are requested at spawn time, not verified runtime billing telemetry.",
+    },
+    workflow: {
+      ...metrics.workflow,
+      reviewMode: state.reviewMode,
+      reviewAssignments: state.reviewAssignments.length,
+      reviewPasses: state.reviewPasses.length,
+      reviewRounds: reviewHistory.length,
+      validationRecorded: state.validation !== null,
+    },
+    likelyDrivers,
+    recommendedImprovements,
+  };
 }
 
 export function loadState(dataDir, sessionId) {
@@ -262,6 +371,48 @@ export function isDeployInvocation(toolName, toolInput, cwd) {
 
   if (/(?:^|__|\.)(?:deploy|publish|promote|rollout|release_create|create_release)(?:$|__|\.|_)/i.test(toolName)) return true;
   return false;
+}
+
+function reviewAssignmentReference(toolInput) {
+  const message = typeof toolInput.message === "string" ? toolInput.message : "";
+  const match = /(?:^|\n)\s*VOLTFLOW_REVIEW_ASSIGNMENT:\s*([a-z0-9][a-z0-9_-]*)\s+([a-f0-9-]+)\s*$/im.exec(message);
+  return match === null ? null : { lane: match[1], token: match[2] };
+}
+
+function boundReviewSpawnViolation(state, toolInput, reference, currentFingerprint) {
+  const assignment = state.reviewAssignments.find(
+    (entry) => entry.lane === reference.lane && entry.token === reference.token && entry.fingerprint === currentFingerprint,
+  );
+  if (assignment === undefined) return "VoltFlow rejected reviewer spawn: assignment is missing, stale, or belongs to a different lane.";
+  if (assignment.spawn !== undefined) return "VoltFlow rejected reviewer spawn: this assignment is already bound to another agent.";
+  const scope = typeof toolInput.message === "string" ? toolInput.message : "";
+  if (toolInput.model === "gpt-5.6-sol" && namedSolReviewException(scope)) return null;
+  if (toolInput.model === "gpt-5.6-terra" && toolInput.reasoning_effort === "high") return null;
+  return "VoltFlow cost policy requires routine review agents to explicitly use model=gpt-5.6-terra and reasoning_effort=high. Sol review requires SOL_EXCEPTION with a named high-risk boundary or a direct user request.";
+}
+
+function bindReviewSpawn(state, input, currentFingerprint) {
+  if (!isRecord(input.tool_input)) return null;
+  const reference = reviewAssignmentReference(input.tool_input);
+  if (reference === null) return null;
+  const assignment = state.reviewAssignments.find(
+    (entry) => entry.lane === reference.lane && entry.token === reference.token && entry.fingerprint === currentFingerprint,
+  );
+  if (assignment === undefined || assignment.spawn !== undefined) return null;
+  const response = isRecord(input.tool_response) ? input.tool_response : {};
+  const agentId = typeof response.agent_id === "string" ? response.agent_id : typeof response.agentId === "string" ? response.agentId : null;
+  if (agentId === null) return { systemMessage: "VoltFlow could not bind the reviewer: the spawn response did not include an agent id." };
+  assignment.spawn = {
+    agentId,
+    model: typeof input.tool_input.model === "string" ? input.tool_input.model : "inherited-or-unknown",
+    reasoningEffort: typeof input.tool_input.reasoning_effort === "string" ? input.tool_input.reasoning_effort : "inherited-or-unknown",
+    at: timestamp(),
+  };
+  return null;
+}
+
+function namedSolReviewException(scope) {
+  return /SOL_EXCEPTION:\s*(?:direct user request|authorization|authentication|private data|private uploads?|payments?|refunds?|booking lifecycle|destructive migration|data[- ]integrity migration|cross[- ]cutting architecture)\b/i.test(scope);
 }
 
 export function workspaceFingerprint(cwd) {
@@ -329,6 +480,10 @@ function onUserPromptLocked(input, context) {
     : freshState(input.session_id, input.cwd, previous, current);
   state.active = true;
   state.promptHash = createHash("sha256").update(input.prompt).digest("hex");
+  const metrics = sessionMetricsFor(state);
+  metrics.visiblePrompt.submissions += 1;
+  metrics.visiblePrompt.bytes += byteSize(input.prompt);
+  increment(metrics.parentModels, typeof input.model === "string" ? input.model : "unknown");
   state.stopBlocks = 0;
   state.reworkCycles = 0;
   state.valueWarningIssued = false;
@@ -339,11 +494,11 @@ function onUserPromptLocked(input, context) {
   const prefix = `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(input.session_id)}`;
   const configNote = context.configError === null ? "" : ` Config warning: ${context.configError}`;
   return userContext(
-    `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
+      `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
       `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
       `For a simple, low-risk edit with no deployment intent, replace start with skip and add --evidence <reason>; skip must happen before any change and does not approve deployment. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
-      `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
+      `Before an independent review, run ${prefix.replace("<command>", "cost")} for the forecast. Routine review agents must explicitly use gpt-5.6-terra at high reasoning; Sol needs a named high-risk exception or direct user request. Run ${prefix.replace("<command>", "report")} at discovery, pre-review, and finish for whole-session cost proxies. Then replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
       `Completion bar: finish when current evidence shows the result is safe and satisfies the requested scope. Theoretical edge cases are advisory unless they are reproducible in ordinary documented use and break requested behavior, a repository invariant, or a material safety boundary. Do not reopen validated work for speculative improvement.${configNote}`,
   );
 }
@@ -371,6 +526,11 @@ function onPreToolUse(input, context) {
     && input.tool_input.fork_turns !== "none"
   ) {
     return deny('VoltFlow requires v2 subagents to use fork_turns: "none".');
+  }
+  if (state?.active === true && input.tool_name.endsWith("spawn_agent") && isRecord(input.tool_input)) {
+    const reference = reviewAssignmentReference(input.tool_input);
+    const violation = reference === null ? null : boundReviewSpawnViolation(state, input.tool_input, reference, context.fingerprint(input.cwd));
+    if (violation !== null) return deny(violation);
   }
 
   if (isDeployInvocation(input.tool_name, input.tool_input, input.cwd)) {
@@ -421,7 +581,9 @@ function onPostToolUseLocked(input, context) {
   const state = loadState(context.dataDir, input.session_id);
   if (state?.active !== true || !sameWorkspace(state.cwd, input.cwd)) return null;
   const failed = toolFailed(input.tool_response);
+  recordToolUsage(state, input, failed);
   const current = context.fingerprint(input.cwd);
+  const spawnBindingWarning = failed ? null : bindReviewSpawn(state, input, current);
   const recoveredViolation = recoverRevertedViolation(state, current);
 
   const editTool = typeof input.tool_name === "string" && isEditTool(input.tool_name);
@@ -431,6 +593,7 @@ function onPostToolUseLocked(input, context) {
   const fingerprintChanged = current !== null && state.lastFingerprint !== null && current !== state.lastFingerprint;
   let valueWarning = null;
   if ((!failed && editTool) || fingerprintChanged) {
+    sessionMetricsFor(state).workflow.changeEvents += 1;
     const paths = editedPaths(input.tool_input);
     const testOnlyEdit = editTool && paths.length > 0 && paths.every(isTestPath);
     const touchesTest = (editTool && paths.some(isTestPath)) || (command !== null && commandMentionsTestPath(command));
@@ -463,6 +626,9 @@ function onPostToolUseLocked(input, context) {
   }
 
   if (command !== null && isTestCommand(command)) {
+    const workflow = sessionMetricsFor(state).workflow;
+    workflow.testRuns += 1;
+    if (failed) workflow.failedTestRuns += 1;
     if (failed && state.tdd === "required" && state.tddViolation !== true) {
       state.red = evidence(command, current);
       state.redObserved = state.red;
@@ -472,7 +638,7 @@ function onPostToolUseLocked(input, context) {
   if (current !== null) state.lastFingerprint = current;
   state.updatedAt = timestamp();
   saveState(context.dataDir, state);
-  return valueWarning;
+  return valueWarning ?? spawnBindingWarning;
 }
 
 function onSubagentStart() {
@@ -508,6 +674,11 @@ function onSubagentStopLocked(input, context) {
     return { systemMessage: "VoltFlow ignored an unassigned or stale review receipt." };
   }
 
+  const agentId = typeof input.agent_id === "string" ? input.agent_id : "unknown";
+  if (assignment.spawn === undefined || assignment.spawn.agentId !== agentId) {
+    return { systemMessage: "VoltFlow ignored review receipt: it must come from the bound reviewer agent." };
+  }
+
   if (outcome === "FAIL") {
     state.reviewFailure = { lane, at: timestamp() };
     state.reviewPasses = [];
@@ -521,7 +692,6 @@ function onSubagentStopLocked(input, context) {
   if (blocker !== null) return { systemMessage: `VoltFlow ignored review pass: ${blocker}` };
   if (current === null) return { systemMessage: "VoltFlow ignored review pass: Git fingerprint unavailable." };
 
-  const agentId = typeof input.agent_id === "string" ? input.agent_id : "unknown";
   state.reviewPasses = state.reviewPasses.filter((entry) => entry.fingerprint === current);
   if (!state.reviewPasses.some((entry) => entry.agentId === agentId)) {
       state.reviewPasses.push({ agentId, lane, fingerprint: current, at: timestamp() });
@@ -595,6 +765,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     validation: null,
     reviewAssignments: [],
     reviewPasses: [],
+    reviewHistory: [],
     reviewFailure: null,
     approval: previous?.approval?.fingerprint === currentFingerprint ? previous.approval : null,
     override:
@@ -605,10 +776,82 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     stopBlocks: 0,
     reworkCycles: 0,
     valueWarningIssued: false,
+    sessionMetrics: validSessionMetrics(previous?.sessionMetrics) ? previous.sessionMetrics : freshSessionMetrics(),
     lastFingerprint: currentFingerprint,
     createdAt: timestamp(),
     updatedAt: timestamp(),
   };
+}
+
+function freshSessionMetrics() {
+  return {
+    parentModels: {},
+    visiblePrompt: { submissions: 0, bytes: 0 },
+    toolContext: { calls: 0, inputBytes: 0, outputBytes: 0, categories: {} },
+    delegation: { spawnRequests: 0, handoffBytes: 0, requestedProfiles: {} },
+    workflow: { changeEvents: 0, testRuns: 0, failedTestRuns: 0, validationRecords: 0 },
+  };
+}
+
+function sessionMetricsFor(state) {
+  const metrics = validSessionMetrics(state.sessionMetrics) ? state.sessionMetrics : freshSessionMetrics();
+  state.sessionMetrics = metrics;
+  return metrics;
+}
+
+function recordToolUsage(state, input, failed) {
+  if (typeof input.tool_name !== "string") return;
+  const metrics = sessionMetricsFor(state);
+  const category = toolCategory(input.tool_name, input.tool_input);
+  const inputBytes = byteSize(input.tool_input);
+  const outputBytes = byteSize(input.tool_response);
+  metrics.toolContext.calls += 1;
+  metrics.toolContext.inputBytes += inputBytes;
+  metrics.toolContext.outputBytes += outputBytes;
+  const bucket = metrics.toolContext.categories[category] ?? { calls: 0, inputBytes: 0, outputBytes: 0, failures: 0 };
+  bucket.calls += 1;
+  bucket.inputBytes += inputBytes;
+  bucket.outputBytes += outputBytes;
+  if (failed) bucket.failures += 1;
+  metrics.toolContext.categories[category] = bucket;
+
+  if (category !== "delegation" || failed || !isRecord(input.tool_input)) return;
+  metrics.delegation.spawnRequests += 1;
+  metrics.delegation.handoffBytes += byteSize(input.tool_input.task_name) + byteSize(input.tool_input.message);
+  const model = typeof input.tool_input.model === "string" ? input.tool_input.model : "inherited-or-unknown";
+  const reasoningEffort = typeof input.tool_input.reasoning_effort === "string"
+    ? input.tool_input.reasoning_effort
+    : typeof input.tool_input.reasoningEffort === "string"
+      ? input.tool_input.reasoningEffort
+      : "inherited-or-unknown";
+  increment(metrics.delegation.requestedProfiles, `${model}:${reasoningEffort}`);
+}
+
+function toolCategory(toolName, toolInput) {
+  const name = toolName.toLowerCase();
+  const command = isCommandTool(toolName) ? commandFrom(toolInput) : null;
+  if (name.endsWith("spawn_agent")) return "delegation";
+  if (name.includes("codebase_memory") || name.includes("search_graph") || name.includes("trace_path") || name.includes("get_code_snippet")) return "discovery";
+  if (name.includes("github") || name.startsWith("gh_")) return "github";
+  if (name.includes("browser") || name.includes("playwright") || name.includes("chrome")) return "browser";
+  if (command !== null && isTestCommand(command)) return "test";
+  if (isEditTool(toolName)) return "edit";
+  if (isCommandTool(toolName)) return "command";
+  return "other";
+}
+
+function byteSize(value) {
+  if (value === undefined) return 0;
+  if (typeof value === "string") return Buffer.byteLength(value, "utf8");
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  } catch {
+    return 0;
+  }
+}
+
+function increment(record, key) {
+  record[key] = (record[key] ?? 0) + 1;
 }
 
 function gateStatus(state, currentFingerprint) {
@@ -699,6 +942,8 @@ function validState(value, sessionId) {
     && value.reviewAssignments.every(validReviewAssignment)
     && Array.isArray(value.reviewPasses)
     && value.reviewPasses.every(validReviewPass)
+    && (value.reviewHistory === undefined || (Array.isArray(value.reviewHistory) && value.reviewHistory.every(validReviewHistoryEntry)))
+    && (value.sessionMetrics === undefined || validSessionMetrics(value.sessionMetrics))
     && (value.reviewFailure === null || (isRecord(value.reviewFailure) && typeof value.reviewFailure.lane === "string"))
     && (value.approval === null || validApproval(value.approval))
     && (value.override === null || validOverride(value.override))
@@ -717,6 +962,15 @@ function validReviewAssignment(value) {
     && typeof value.lane === "string"
     && typeof value.token === "string"
     && typeof value.fingerprint === "string"
+    && typeof value.at === "string"
+    && (value.spawn === undefined || validReviewSpawn(value.spawn));
+}
+
+function validReviewSpawn(value) {
+  return isRecord(value)
+    && typeof value.agentId === "string"
+    && typeof value.model === "string"
+    && typeof value.reasoningEffort === "string"
     && typeof value.at === "string";
 }
 
@@ -725,6 +979,51 @@ function validReviewPass(value) {
     && typeof value.agentId === "string"
     && typeof value.lane === "string"
     && typeof value.fingerprint === "string"
+    && typeof value.at === "string";
+}
+
+function validSessionMetrics(value) {
+  return isRecord(value)
+    && isCountRecord(value.parentModels)
+    && isRecord(value.visiblePrompt)
+    && validCount(value.visiblePrompt.submissions)
+    && validCount(value.visiblePrompt.bytes)
+    && isRecord(value.toolContext)
+    && validCount(value.toolContext.calls)
+    && validCount(value.toolContext.inputBytes)
+    && validCount(value.toolContext.outputBytes)
+    && isRecord(value.toolContext.categories)
+    && Object.values(value.toolContext.categories).every(validToolCategoryMetrics)
+    && isRecord(value.delegation)
+    && validCount(value.delegation.spawnRequests)
+    && validCount(value.delegation.handoffBytes)
+    && isCountRecord(value.delegation.requestedProfiles)
+    && isRecord(value.workflow)
+    && validCount(value.workflow.changeEvents)
+    && validCount(value.workflow.testRuns)
+    && validCount(value.workflow.failedTestRuns)
+    && validCount(value.workflow.validationRecords);
+}
+
+function validToolCategoryMetrics(value) {
+  return isRecord(value)
+    && validCount(value.calls)
+    && validCount(value.inputBytes)
+    && validCount(value.outputBytes)
+    && validCount(value.failures);
+}
+
+function isCountRecord(value) {
+  return isRecord(value) && Object.values(value).every(validCount);
+}
+
+function validCount(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function validReviewHistoryEntry(value) {
+  return isRecord(value)
+    && typeof value.lane === "string"
     && typeof value.at === "string";
 }
 
@@ -866,9 +1165,10 @@ function compilePaths(value, root) {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
     throw new Error("fingerprintPaths must be an array of relative file paths");
   }
+  const normalizedRoot = path.resolve(root);
   for (const entry of value) {
-    const resolved = path.resolve(root, entry);
-    if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+    const resolved = path.resolve(normalizedRoot, entry);
+    if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) {
       throw new Error("fingerprintPaths entries must stay inside the Git worktree");
     }
   }
@@ -876,8 +1176,9 @@ function compilePaths(value, root) {
 }
 
 function hashWorkspacePath(hash, root, relativePath, allowMissing = false) {
-  const resolved = path.resolve(root, relativePath);
-  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) return false;
+  const normalizedRoot = path.resolve(root);
+  const resolved = path.resolve(normalizedRoot, relativePath);
+  if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) return false;
   hashField(hash, "path", relativePath);
   if (!existsSync(resolved)) {
     if (!allowMissing) return false;
@@ -886,7 +1187,7 @@ function hashWorkspacePath(hash, root, relativePath, allowMissing = false) {
   }
   const stats = lstatSync(resolved);
   if (stats.isDirectory()) return false;
-  const object = git(root, ["hash-object", "--no-filters", "--", relativePath]);
+  const object = git(normalizedRoot, ["hash-object", "--no-filters", "--", relativePath]);
   if (!object.ok) return false;
   hashField(hash, "mode", String(stats.mode));
   hashField(hash, "object", object.stdout);

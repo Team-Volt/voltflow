@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -115,6 +116,22 @@ function review(fx, agentId, lane) {
   assert.equal(assigned.exitCode, 0, assigned.stderr);
   const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
   assert.ok(token);
+  const toolInput = {
+    task_name: "checker",
+    message: `VOLTFLOW_REVIEW_ASSIGNMENT: ${lane} ${token}`,
+    fork_turns: "none",
+    model: "gpt-5.6-terra",
+    reasoning_effort: "high",
+  };
+  assert.equal(handleHook(input("PreToolUse", { tool_name: "agentsspawn_agent", tool_input: toolInput }), fx.options), null);
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "agentsspawn_agent",
+      tool_input: toolInput,
+      tool_response: { agent_id: agentId },
+    }),
+    fx.options,
+  );
   return handleHook(
     input("SubagentStop", {
       agent_id: agentId,
@@ -143,11 +160,12 @@ test("prompt injection starts session state and names the exact controller", () 
     fx.options,
   );
 
-  assert.match(output.hookSpecificOutput.additionalContext, /node ['"]\/plugin\/scripts\/voltflow\.mjs['"]/);
+  assert.match(output.hookSpecificOutput.additionalContext, /node ['"][^'"]*plugin[\\/]scripts[\\/]voltflow\.mjs['"]/);
   assert.match(output.hookSpecificOutput.additionalContext, /--session ['"]session-1['"]/);
   assert.match(output.hookSpecificOutput.additionalContext, /external permission/i);
   assert.match(output.hookSpecificOutput.additionalContext, /theoretical edge cases are advisory/i);
   assert.match(output.hookSpecificOutput.additionalContext, /safe and satisfies the requested scope/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /cost.*gpt-5\.6-terra.*high/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
@@ -484,7 +502,198 @@ test("an unfinished workflow reactivates when the user says continue", () => {
 test("controller help lists the workflow commands", () => {
   const result = runController(["--help"]);
   assert.equal(result.exitCode, 0);
-  assert.match(result.stdout, /start\|skip\|red\|validate\|review\|approve\|status\|gate/);
+  assert.match(result.stdout, /start\|skip\|red\|validate\|review\|approve\|status\|cost\|report\|gate/);
+});
+
+test("cost report plans Terra high reviews and records review-round pressure", () => {
+  const fx = fixture();
+  start(fx, { tier: "standard", tdd: "exempt", review: "single" });
+
+  const initial = runController(["cost", "--session", "session-1"], { ...fx.options, cwd: "/repo" });
+  assert.equal(initial.exitCode, 0, initial.stderr);
+  const initialReport = JSON.parse(initial.stdout);
+  assert.equal(initialReport.exactTokenTelemetry, "unavailable");
+  assert.deepEqual(initialReport.forecast.routineReview, {
+    model: "gpt-5.6-terra",
+    reasoningEffort: "high",
+    reviewers: 1,
+  });
+
+  const validated = runController(
+    ["validate", "--session", "session-1", "--evidence", "closest relevant check passed"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(validated.exitCode, 0, validated.stderr);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(assigned.exitCode, 0, assigned.stderr);
+
+  const report = JSON.parse(runController(["cost", "--session", "session-1"], { ...fx.options, cwd: "/repo" }).stdout);
+  assert.equal(report.observed.reviewAssignments, 1);
+  assert.equal(report.observed.reviewPasses, 0);
+  assert.equal(report.likelyDrivers[0], "A pending independent review is active.");
+});
+
+test("session report tracks metadata-only whole-session cost proxies", () => {
+  const fx = fixture();
+  const secret = "do-not-persist-this-content";
+  handleHook(
+    input("UserPromptSubmit", { prompt: `Investigate ${secret}`, model: "gpt-5.6-terra" }),
+    fx.options,
+  );
+  start(fx, { tier: "standard", tdd: "exempt", review: "single" });
+
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "mcp__codebase_memory_mcp__search_graph",
+      tool_input: { query: "Asset" },
+      tool_response: { output: "matched symbol" },
+    }),
+    fx.options,
+  );
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "agentsspawn_agent",
+      tool_input: {
+        task_name: "reviewer",
+        message: `WORK LAYER: review ${secret}`,
+        fork_turns: "none",
+        model: "gpt-5.6-terra",
+        reasoning_effort: "high",
+      },
+      tool_response: { agent_id: "agent-1" },
+    }),
+    fx.options,
+  );
+
+  const result = runController(["report", "--session", "session-1"], { ...fx.options, cwd: "/repo" });
+  assert.equal(result.exitCode, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.exactTokenTelemetry, "unavailable");
+  assert.equal(report.parentModel.observed["gpt-5.6-terra"], 1);
+  assert.ok(report.visiblePrompt.bytes > 0);
+  assert.equal(report.toolContext.categories.discovery.calls, 1);
+  assert.equal(report.delegation.requestedProfiles["gpt-5.6-terra:high"], 1);
+  assert.equal(report.delegation.handoffBytes > 0, true);
+  assert.equal(JSON.stringify(report).includes(secret), false);
+  assert.equal(JSON.stringify(loadState(fx.dataDir, "session-1")).includes(secret), false);
+});
+
+test("session report retains proxy metrics across completed turns", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "first turn", model: "gpt-5.6-terra" }), fx.options);
+  start(fx, { tier: "trivial", tdd: "exempt", review: "self" });
+  handleHook(input("Stop", { last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", { prompt: "second turn", model: "gpt-5.6-terra" }), fx.options);
+  const result = runController(["report", "--session", "session-1"], { ...fx.options, cwd: "/repo" });
+  assert.equal(result.exitCode, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.visiblePrompt.submissions, 2);
+  assert.equal(report.parentModel.observed["gpt-5.6-terra"], 2);
+});
+
+test("routine review agents require Terra high unless a named Sol exception applies", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Review the parser" }), fx.options);
+  start(fx, { tier: "standard", tdd: "exempt", review: "single" });
+
+  const validated = runController(
+    ["validate", "--session", "session-1", "--evidence", "closest relevant check passed"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(validated.exitCode, 0, validated.stderr);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(assigned.exitCode, 0, assigned.stderr);
+  const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
+  assert.ok(token);
+
+  const reviewSpawn = (model, reasoningEffort, message) => handleHook(
+    input("PreToolUse", {
+      tool_name: "agentsspawn_agent",
+      tool_input: {
+        task_name: "checker",
+        message,
+        fork_turns: "none",
+        model,
+        reasoning_effort: reasoningEffort,
+      },
+    }),
+    fx.options,
+  );
+
+  const assignment = `VOLTFLOW_REVIEW_ASSIGNMENT: composite ${token}`;
+  const denied = reviewSpawn("gpt-5.6-sol", "high", assignment);
+  assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /gpt-5\.6-terra.*high/i);
+  assert.equal(reviewSpawn("gpt-5.6-terra", "high", assignment), null);
+});
+
+test("review receipts require the agent and profile bound to an explicit assignment", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Review the parser" }), fx.options);
+  start(fx, { tier: "standard", tdd: "exempt", review: "single" });
+  const validated = runController(
+    ["validate", "--session", "session-1", "--evidence", "closest relevant check passed"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(validated.exitCode, 0, validated.stderr);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
+  assert.ok(token);
+  const toolInput = {
+    task_name: "inspection",
+    message: `VOLTFLOW_REVIEW_ASSIGNMENT: composite ${token}`,
+    fork_turns: "none",
+    model: "gpt-5.6-terra",
+    reasoning_effort: "high",
+  };
+  assert.equal(handleHook(input("PreToolUse", { tool_name: "agentsspawn_agent", tool_input: toolInput }), fx.options), null);
+  handleHook(
+    input("PostToolUse", { tool_name: "agentsspawn_agent", tool_input: toolInput, tool_response: { agent_id: "bound-agent" } }),
+    fx.options,
+  );
+  assert.deepEqual(loadState(fx.dataDir, "session-1").reviewAssignments[0].spawn, {
+    agentId: "bound-agent",
+    model: "gpt-5.6-terra",
+    reasoningEffort: "high",
+    at: loadState(fx.dataDir, "session-1").reviewAssignments[0].spawn.at,
+  });
+
+  const wrongAgent = handleHook(
+    input("SubagentStop", {
+      agent_id: "other-agent",
+      last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${token}`,
+    }),
+    fx.options,
+  );
+  assert.match(wrongAgent.systemMessage, /bound reviewer agent/i);
+  assert.equal(loadState(fx.dataDir, "session-1").approval, null);
+
+  assert.equal(
+    handleHook(
+      input("SubagentStop", {
+        agent_id: "bound-agent",
+        last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${token}`,
+      }),
+      fx.options,
+    ),
+    null,
+  );
+  assert.equal(loadState(fx.dataDir, "session-1").approval.source, "subagent");
+});
+
+test("installed PostToolUse hook captures every tool category", () => {
+  const hooks = JSON.parse(readFileSync(new URL("../hooks/hooks.json", import.meta.url), "utf8"));
+  assert.equal(hooks.hooks.PostToolUse[0].matcher, "*");
 });
 
 function productionPatchDecision(fx) {
@@ -640,6 +849,29 @@ test("review receipts require a fingerprint-bound assignment token", () => {
   assert.equal(assigned.exitCode, 0, assigned.stderr);
   const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
   assert.ok(token);
+  const reviewToolInput = {
+    task_name: "checker",
+    message: `VOLTFLOW_REVIEW_ASSIGNMENT: correctness-security ${token}`,
+    fork_turns: "none",
+    model: "gpt-5.6-terra",
+    reasoning_effort: "high",
+  };
+  handleHook(
+    input("SubagentStop", {
+      agent_id: "reviewer-1",
+      last_assistant_message: `VOLTFLOW_REVIEW: PASS correctness-security ${token}`,
+    }),
+    fx.options,
+  );
+  assert.equal(loadState(fx.dataDir, "session-1").reviewPasses.length, 0);
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "agentsspawn_agent",
+      tool_input: reviewToolInput,
+      tool_response: { agent_id: "reviewer-1" },
+    }),
+    fx.options,
+  );
   handleHook(
     input("SubagentStop", {
       agent_id: "reviewer-1",
@@ -720,6 +952,25 @@ test("concurrent split reviews retain both receipts", async () => {
   const validationToken = /token=(\S+)/.exec(validation.stdout)?.[1];
   assert.ok(correctnessToken, correctness.stderr);
   assert.ok(validationToken, validation.stderr);
+  for (const [lane, token, agentId] of [
+    ["correctness-security", correctnessToken, "reviewer-a"],
+    ["validation-scope", validationToken, "reviewer-b"],
+  ]) {
+    handleHook({
+      hook_event_name: "PostToolUse",
+      session_id: "parallel",
+      cwd: root,
+      tool_name: "agentsspawn_agent",
+      tool_input: {
+        task_name: "checker",
+        message: `VOLTFLOW_REVIEW_ASSIGNMENT: ${lane} ${token}`,
+        fork_turns: "none",
+        model: "gpt-5.6-terra",
+        reasoning_effort: "high",
+      },
+      tool_response: { agent_id: agentId },
+    }, { dataDir });
+  }
   await Promise.all([
     hookProcess(root, dataDir, {
       hook_event_name: "SubagentStop",
@@ -983,11 +1234,19 @@ test("controller state cannot cross repository roots", () => {
   assert.equal(result.exitCode, 1);
 });
 
-test("controller recognizes symlink aliases for the same workspace", () => {
+test("controller recognizes symlink aliases for the same workspace", (t) => {
   const fx = fixture();
   const other = fixture();
   const alias = `${fx.root}-alias`;
-  symlinkSync(fx.root, alias, "dir");
+  try {
+    symlinkSync(fx.root, alias, "dir");
+  } catch (error) {
+    if (error?.code === "EPERM" || error?.code === "EACCES" || error?.code === "ENOSYS") {
+      t.skip(`symlinks unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
   const started = runController(
     ["start", "--session", "aliased", "--tier", "standard", "--tdd", "exempt", "--review", "single"],
     { ...fx.options, cwd: alias },
@@ -1020,7 +1279,7 @@ test("quoted override language does not arm deployment", () => {
   assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /override armed/i);
 });
 
-test("fingerprints distinguish large changes and untracked executable modes", () => {
+test("fingerprints distinguish large changes and untracked executable modes", (t) => {
   const root = mkdtempSync(path.join(tmpdir(), "voltflow-fingerprint-"));
   git(root, "init", "-q");
   git(root, "config", "user.email", "qa@example.com");
@@ -1035,6 +1294,11 @@ test("fingerprints distinguish large changes and untracked executable modes", ()
   const second = workspaceFingerprint(root);
   assert.equal(first, null);
   assert.equal(second, null);
+
+  if (process.platform === "win32") {
+    t.skip("Windows does not preserve executable mode changes with chmodSync");
+    return;
+  }
 
   const modeRoot = mkdtempSync(path.join(tmpdir(), "voltflow-mode-"));
   git(modeRoot, "init", "-q");
@@ -1076,7 +1340,7 @@ test("fingerprints frame untracked path fields unambiguously", () => {
   writeFileSync(secondPath, "same");
   const twoFiles = workspaceFingerprint(root);
   const mode = String(lstatSync(firstPath).mode);
-  const object = git(root, "hash-object", "--no-filters", "--", "a");
+  const object = git(root, "hash-object", "--no-filters", "--", "a").trim();
   unlinkSync(firstPath);
   unlinkSync(secondPath);
   writeFileSync(path.join(root, `a${mode}${object}b`), "same");
@@ -1126,10 +1390,10 @@ function git(root, ...args) {
 
 function hookProcess(cwd, dataDir, payload) {
   return new Promise((resolve, reject) => {
-    const entry = new URL("../scripts/voltflow.mjs", import.meta.url);
-    const child = spawn(process.execPath, [entry.pathname, "hook"], {
+    const entryPath = fileURLToPath(new URL("../scripts/voltflow.mjs", import.meta.url));
+    const child = spawn(process.execPath, [entryPath, "hook"], {
       cwd,
-      env: { ...process.env, PLUGIN_DATA: dataDir, PLUGIN_ROOT: path.dirname(path.dirname(entry.pathname)) },
+      env: { ...process.env, PLUGIN_DATA: dataDir, PLUGIN_ROOT: path.dirname(path.dirname(entryPath)) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stderr = "";

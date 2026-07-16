@@ -55,6 +55,12 @@ Each spawn prompt contains five labeled fields and nothing repetitive:
 
 Treat examples as examples, not hidden requirements. When instructions conflict, follow the user outcome, repository invariants, and the bounded assignment in that order. Return a concise result with evidence; do not invent neighboring work to make the assignment look complete.
 
+## Monitor whole-session cost honestly
+
+Run the injected `report` command after discovery, before independent review, and at finish. It is a proxy ledger, not a token meter: it records visible prompt bytes, tool input/output byte totals by category, requested agent profiles and handoff bytes, validation activity, and review waves. It never stores prompt, tool, or reviewer content, and it cannot see hidden reasoning, billing, quota, or actual provider token usage.
+
+Use the report to remove avoidable repetition: narrow discovery output, keep delegations to one bounded outcome, batch related fixes before a review wave, and use split review only for high-risk work. Do not claim that requested subagent profiles are verified runtime billing telemetry.
+
 ## Review in proportion to risk
 
 Review the final diff against the request, not against an imagined ideal rewrite. Cover correctness, regression risk, relevant security boundaries, validation quality, and unnecessary scope.
@@ -63,7 +69,7 @@ Review the final diff against the request, not against an imagined ideal rewrite
 - `single`: one independent reviewer covers the full checklist.
 - `split`: two reviewers use non-overlapping lanes: correctness/security and validation/scope.
 
-Before spawning each independent reviewer, run the injected controller with `review --lane <lane>`. Put the returned token in the review prompt. The reviewer ends with `VOLTFLOW_REVIEW: PASS <lane> <token>` only when no blocking finding remains, or `VOLTFLOW_REVIEW: FAIL <lane> <token>` after its findings. Receipts without a current assignment are ignored, a failed lane clears earlier passes, and any edit invalidates every receipt.
+Before spawning each independent reviewer, run the injected controller with `review --lane <lane>`. Put `VOLTFLOW_REVIEW_ASSIGNMENT: <lane> <token>` in the spawn prompt. VoltFlow binds the successful spawn's agent ID, requested model, and reasoning effort to that assignment. The bound reviewer ends with `VOLTFLOW_REVIEW: PASS <lane> <token>` only when no blocking finding remains, or `VOLTFLOW_REVIEW: FAIL <lane> <token>` after its findings. Receipts without a current assignment or bound agent are ignored, a failed lane clears earlier passes, and any edit invalidates every receipt.
 
 ### Bound review exploration
 
@@ -71,7 +77,7 @@ Before spawning a reviewer, state the supported product boundary and material co
 
 When failures share one mechanism, fix and test that mechanism once. Do not keep adding syntax-specific patterns after the boundary is characterized. If complete enforcement would require a shell parser, a general solver, or control over an interception surface the host does not provide, keep the local guard conservative, document the limit, and route authoritative enforcement to the controller or project configuration.
 
-After a failed review, group findings by root cause and rerun only affected coverage. If a rerun finds another variant of the same bounded limitation, stop patching variants and reassess the abstraction or accepted boundary. Finish when the original acceptance criteria have current evidence and no material ordinary-use blocker remains. Use Sol high for routine independent review; raise effort only for a named risk that changes the completion bar.
+After a failed review, group findings by root cause and rerun only affected coverage. If a rerun finds another variant of the same bounded limitation, stop patching variants and reassess the abstraction or accepted boundary. Finish when the original acceptance criteria have current evidence and no material ordinary-use blocker remains. Use Terra high for routine independent review. Use Sol only when the review names an authorization, private-data, payment, booking, destructive-migration, data-integrity, or cross-cutting-architecture risk that changes the completion bar, or when the user explicitly requests Sol.
 
 ## Gate deployment
 
