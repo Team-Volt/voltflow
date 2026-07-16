@@ -95,9 +95,10 @@ function productionPatch() {
   });
 }
 
-function recordProductionEdit(fx) {
+function recordProductionEdit(fx, model = "gpt-5.6-sol") {
   handleHook(
     input("PostToolUse", {
+      model,
       tool_name: "apply_patch",
       tool_input: productionPatch().tool_input,
       tool_response: "Success. Updated files.",
@@ -145,6 +146,8 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /node ['"]\/plugin\/scripts\/voltflow\.mjs['"]/);
   assert.match(output.hookSpecificOutput.additionalContext, /--session ['"]session-1['"]/);
   assert.match(output.hookSpecificOutput.additionalContext, /external permission/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /theoretical edge cases are advisory/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /safe and satisfies the requested scope/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
@@ -197,6 +200,8 @@ test("subagent contract limits per-slice TDD to required work", () => {
   assert.match(output.hookSpecificOutput.additionalContext, /TDD-exempt work.*do not create tests/i);
   assert.match(output.hookSpecificOutput.additionalContext, /every changed observable layer/i);
   assert.match(output.hookSpecificOutput.additionalContext, /syntax checks do not prove runtime behavior/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /ordinary documented use/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /safe and satisfies scope/i);
 });
 
 test("active v2 spawns require isolated context", () => {
@@ -322,6 +327,32 @@ test("self review requires validation and becomes stale after an edit", () => {
 
   recordProductionEdit(fx);
   assert.equal(deploy(fx).hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("the active model is steered after repeatedly reopening a validated production diff", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Update the flag" }), fx.options);
+  start(fx, { tier: "trivial", tdd: "exempt", review: "self" });
+  recordProductionEdit(fx, "gpt-5.6-terra");
+  passedTest(fx);
+
+  assert.equal(handleHook(productionPatch(), fx.options), null);
+  recordProductionEdit(fx, "gpt-5.6-terra");
+  passedTest(fx);
+
+  assert.equal(handleHook(productionPatch(), fx.options), null);
+  const warning = handleHook(
+    input("PostToolUse", {
+      model: "gpt-5.6-terra",
+      tool_name: "apply_patch",
+      tool_input: productionPatch().tool_input,
+      tool_response: "Success. Updated files.",
+    }),
+    fx.options,
+  );
+
+  assert.match(warning.systemMessage, /you have reopened a validated diff twice/i);
+  assert.match(warning.systemMessage, /concrete, reproducible, material blocker/i);
 });
 
 test("deployment detection covers defaults and project matchers", () => {
