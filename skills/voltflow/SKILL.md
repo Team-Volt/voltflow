@@ -11,7 +11,9 @@ The hook injects an exact controller command and session id. Use those values ve
 
 ## Classify before editing
 
-Inspect the repository and relevant instructions first, then choose one tier:
+Inspect the repository and relevant instructions first. Before choosing a tier, skip VoltFlow entirely when the task is one simple, low-risk edit with no executable behavior, security boundary, or deployment intent—for example a typo, copy change, prose-only file, or inert metadata update. Run the injected controller with `skip --evidence <reason>` before editing. A skipped prompt needs no TDD, validation, fingerprint, or review; deployment remains gated.
+
+Otherwise choose one tier:
 
 - `trivial`: one obvious location, no behavioral ambiguity, low blast radius. Use an inline intent, no planner, and self-review.
 - `standard`: a bounded feature or fix across established layers. Use a short checklist and one composite reviewer when code changes.
