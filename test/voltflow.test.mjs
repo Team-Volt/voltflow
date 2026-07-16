@@ -148,6 +148,46 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
+test("simple work can skip workflow ceremony without granting deployment approval", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Fix one typo" }), fx.options);
+
+  const skipped = runController(
+    ["skip", "--session", "session-1", "--evidence", "single prose edit with no deployment intent"],
+    { ...fx.options, cwd: "/repo", fingerprint: () => null },
+  );
+  assert.equal(skipped.exitCode, 0, skipped.stderr);
+  assert.equal(loadState(fx.dataDir, "session-1").active, false);
+  assert.equal(productionPatchDecision(fx), null);
+  assert.equal(handleHook(input("Stop", { last_assistant_message: "Done" }), fx.options), null);
+  assert.equal(deploy(fx).hookSpecificOutput.permissionDecision, "deny");
+
+  handleHook(input("UserPromptSubmit", { prompt: "Make another change" }), fx.options);
+  start(fx, { tier: "trivial", tdd: "exempt", review: "self" });
+  recordProductionEdit(fx);
+  const late = runController(
+    ["skip", "--session", "session-1", "--evidence", "too late"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(late.exitCode, 1);
+
+  const failedMutation = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Fix one typo" }), failedMutation.options);
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "exec_command",
+      tool_input: { cmd: "sed -i s/a/b/ README.md" },
+      tool_response: { exit_code: 1 },
+    }),
+    { ...failedMutation.options, fingerprint: () => "diff-b" },
+  );
+  const failedMutationSkip = runController(
+    ["skip", "--session", "session-1", "--evidence", "too late"],
+    { ...failedMutation.options, cwd: "/repo", fingerprint: () => "diff-b" },
+  );
+  assert.equal(failedMutationSkip.exitCode, 1);
+});
+
 test("subagent contract limits per-slice TDD to required work", () => {
   const output = handleHook(input("SubagentStart"));
   assert.match(output.hookSpecificOutput.additionalContext, /when TDD is required/i);
@@ -413,7 +453,7 @@ test("an unfinished workflow reactivates when the user says continue", () => {
 test("controller help lists the workflow commands", () => {
   const result = runController(["--help"]);
   assert.equal(result.exitCode, 0);
-  assert.match(result.stdout, /start\|red\|validate\|review\|approve\|status\|gate/);
+  assert.match(result.stdout, /start\|skip\|red\|validate\|review\|approve\|status\|gate/);
 });
 
 function productionPatchDecision(fx) {

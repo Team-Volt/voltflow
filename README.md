@@ -17,6 +17,8 @@ Start a new Codex task, run `/hooks`, inspect the VoltFlow hook commands, and tr
 
 ## What it enforces
 
+Simple, low-risk edits with no executable behavior or deployment intent can skip the workflow before the first change. The agent records a reason with the controller, then VoltFlow stands down for that prompt: no TDD, validation, fingerprint, review, or Stop warning. Skipping never grants deployment approval.
+
 VoltFlow classifies work as `trivial`, `standard`, or `high`. Each tier has a minimum review mode: self-review for trivial work, one composite reviewer for standard work, and two independent lanes for high-risk work. An active workflow can be upgraded, but it cannot be downgraded to bypass its gate.
 
 Behavioral changes follow RED, GREEN, REFACTOR. The hook allows test edits before RED but blocks production edits until it has observed a failing test or the agent records a manual reproduction. Later test edits clear the current production-edit authorization without erasing the fact that RED occurred, so final review does not demand a fake rerun against already-fixed code. It also detects file changes made through shell commands after they run, so changing the tool name does not bypass evidence invalidation. Only a successful, directly executed test command records automated validation. Prose, generated output, and metadata-only work use `tdd=exempt` with the closest useful validation.
@@ -73,6 +75,10 @@ The prompt hook supplies the real plugin path, data path, and session id. These 
 node <plugin-root>/scripts/voltflow.mjs start \
   --data-dir <plugin-data> --session <session-id> \
   --tier standard --tdd required --review single
+
+node <plugin-root>/scripts/voltflow.mjs skip \
+  --data-dir <plugin-data> --session <session-id> \
+  --evidence "single prose edit with no deployment intent"
 
 node <plugin-root>/scripts/voltflow.mjs red \
   --data-dir <plugin-data> --session <session-id> \

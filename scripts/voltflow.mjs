@@ -21,7 +21,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const TIERS = new Set(["trivial", "standard", "high"]);
 const TDD_MODES = new Set(["required", "exempt"]);
 const REVIEW_MODES = new Set(["self", "single", "split"]);
-const MUTATING_COMMANDS = new Set(["start", "red", "validate", "review", "approve"]);
+const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "review", "approve"]);
 const SPLIT_LANES = new Set(["correctness-security", "validation-scope"]);
 const REVIEW_RANK = { self: 0, single: 1, split: 2 };
 const TIER_RANK = { trivial: 0, standard: 1, high: 2 };
@@ -48,8 +48,9 @@ const OVERRIDE_INTENT = /^\s*(?:(?:voltflow[:,]?\s+)?(?:please\s+)?(?:override|b
 const OVERRIDE_QUESTION = /^\s*(?:how|what|when|where|why|who|(?:can|could|should|would|do)\s+(?:i|we)|is\s+it)\b/i;
 const OVERRIDE_NEGATION = /\b(?:do\s+not|don't|dont|never)\s+(?:\w+\s+){0,2}(?:override|bypass|ignore|overrule|waive|deploy|release|ship)\b/i;
 const USAGE = [
-  "Usage: voltflow.mjs start|red|validate|review|approve|status|gate --session <id>",
+  "Usage: voltflow.mjs start|skip|red|validate|review|approve|status|gate --session <id>",
   "start: --tier trivial|standard|high --tdd required|exempt --review self|single|split",
+  "skip: --evidence <reason> (simple work only, before any change)",
   "red|validate: --evidence <text>",
   "review: --lane composite|correctness-security|validation-scope",
   "approve: --self --evidence <text>",
@@ -143,12 +144,36 @@ export function runController(argv, options = {}) {
       reviewFailure: null,
       approval: null,
       override: null,
+      skip: null,
       lastFingerprint: currentFingerprint,
       stopBlocks: 0,
       updatedAt: timestamp(),
     });
     saveState(dataDir, state);
     return success(`VoltFlow started: ${flags.tier}, tdd=${flags.tdd}, review=${flags.review}`);
+  }
+
+  if (command === "skip") {
+    if (!textFlag(flags.evidence)) return failure("skip requires --evidence");
+    if (state.changed) return failure("cannot skip VoltFlow after changes have started");
+    Object.assign(state, {
+      active: false,
+      tier: "unclassified",
+      tdd: "unclassified",
+      reviewMode: "unclassified",
+      red: null,
+      redObserved: null,
+      validation: null,
+      reviewAssignments: [],
+      reviewPasses: [],
+      reviewFailure: null,
+      approval: null,
+      override: null,
+      skip: evidence(flags.evidence, currentFingerprint),
+      updatedAt: timestamp(),
+    });
+    saveState(dataDir, state);
+    return success("VoltFlow skipped for this prompt; deployment remains gated");
   }
 
   if (command === "red") {
@@ -310,6 +335,7 @@ function onUserPromptLocked(input, context) {
   return userContext(
     `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
       `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
+      `For a simple, low-risk edit with no deployment intent, replace start with skip and add --evidence <reason>; skip must happen before any change and does not approve deployment. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
       `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>.${configNote}`,
   );
@@ -396,7 +422,7 @@ function onPostToolUseLocked(input, context) {
     ? commandFrom(input.tool_input)
     : null;
   const fingerprintChanged = current !== null && state.lastFingerprint !== null && current !== state.lastFingerprint;
-  if (!failed && (editTool || fingerprintChanged)) {
+  if ((!failed && editTool) || fingerprintChanged) {
     const paths = editedPaths(input.tool_input);
     const testOnlyEdit = editTool && paths.length > 0 && paths.every(isTestPath);
     const touchesTest = (editTool && paths.some(isTestPath)) || (command !== null && commandMentionsTestPath(command));
@@ -556,6 +582,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
       previous?.override?.fingerprint === currentFingerprint && previous.override.consumed === false
         ? previous.override
         : null,
+    skip: null,
     stopBlocks: 0,
     lastFingerprint: currentFingerprint,
     createdAt: timestamp(),
@@ -651,7 +678,8 @@ function validState(value, sessionId) {
     && value.reviewPasses.every(validReviewPass)
     && (value.reviewFailure === null || (isRecord(value.reviewFailure) && typeof value.reviewFailure.lane === "string"))
     && (value.approval === null || validApproval(value.approval))
-    && (value.override === null || validOverride(value.override));
+    && (value.override === null || validOverride(value.override))
+    && (value.skip === undefined || value.skip === null || validEvidence(value.skip));
 }
 
 function validEvidence(value) {
