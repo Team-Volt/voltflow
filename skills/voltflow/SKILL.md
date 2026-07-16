@@ -69,7 +69,7 @@ Review the final diff against the request, not against an imagined ideal rewrite
 - `single`: one independent reviewer covers the full checklist.
 - `split`: two reviewers use non-overlapping lanes: correctness/security and validation/scope.
 
-Before spawning each independent reviewer, run the injected controller with `review --lane <lane>`. Put the returned token in the review prompt. The reviewer ends with `VOLTFLOW_REVIEW: PASS <lane> <token>` only when no blocking finding remains, or `VOLTFLOW_REVIEW: FAIL <lane> <token>` after its findings. Receipts without a current assignment are ignored, a failed lane clears earlier passes, and any edit invalidates every receipt.
+Before spawning each independent reviewer, run the injected controller with `review --lane <lane>`. Put `VOLTFLOW_REVIEW_ASSIGNMENT: <lane> <token>` in the spawn prompt. VoltFlow binds the successful spawn's agent ID, requested model, and reasoning effort to that assignment. The bound reviewer ends with `VOLTFLOW_REVIEW: PASS <lane> <token>` only when no blocking finding remains, or `VOLTFLOW_REVIEW: FAIL <lane> <token>` after its findings. Receipts without a current assignment or bound agent are ignored, a failed lane clears earlier passes, and any edit invalidates every receipt.
 
 ### Bound review exploration
 

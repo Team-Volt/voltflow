@@ -108,7 +108,7 @@ node <plugin-root>/scripts/voltflow.mjs gate \
   --data-dir <plugin-data> --session <session-id>
 ```
 
-Give the token returned by `review` to that reviewer. Its final line must be `VOLTFLOW_REVIEW: PASS <lane> <token>` or `VOLTFLOW_REVIEW: FAIL <lane> <token>`.
+Give the token returned by `review` to that reviewer and include `VOLTFLOW_REVIEW_ASSIGNMENT: <lane> <token>` in that spawn prompt. VoltFlow binds the successful spawn's agent ID, requested model, and reasoning effort to the assignment; only that agent's matching final line is accepted: `VOLTFLOW_REVIEW: PASS <lane> <token>` or `VOLTFLOW_REVIEW: FAIL <lane> <token>`.
 
 `cost` reports the planned routine-review profile, current review-round pressure, and likely usage drivers. `report` adds whole-session proxies: observed parent model metadata, visible prompt size, tool input/output byte totals grouped by category, requested subagent profiles and handoff size, test/validation activity, and review waves. Run it after discovery, before review, and at finish.
 

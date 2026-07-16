@@ -214,7 +214,7 @@ export function runController(argv, options = {}) {
     state.reviewHistory ??= [];
     state.reviewHistory.push({ lane: flags.lane, at: timestamp() });
     saveState(dataDir, state);
-    return success(`VoltFlow review assigned: ${flags.lane} token=${token}`);
+    return success(`VoltFlow review assigned: ${flags.lane} token=${token}\nInclude VOLTFLOW_REVIEW_ASSIGNMENT: ${flags.lane} ${token} in the reviewer spawn prompt.`);
   }
 
   if (command === "approve") {
@@ -373,16 +373,42 @@ export function isDeployInvocation(toolName, toolInput, cwd) {
   return false;
 }
 
-function routineReviewSpawnViolation(toolInput) {
-  const taskName = typeof toolInput.task_name === "string" ? toolInput.task_name : "";
+function reviewAssignmentReference(toolInput) {
   const message = typeof toolInput.message === "string" ? toolInput.message : "";
-  const scope = `${taskName}\n${message}`;
-  if (!/(?:\b(?:review|reviewer|adversarial review|correctness-security|validation-scope|composite review)\b|WORK LAYER:\s*review\b)/i.test(scope)) {
-    return null;
-  }
+  const match = /(?:^|\n)\s*VOLTFLOW_REVIEW_ASSIGNMENT:\s*([a-z0-9][a-z0-9_-]*)\s+([a-f0-9-]+)\s*$/im.exec(message);
+  return match === null ? null : { lane: match[1], token: match[2] };
+}
+
+function boundReviewSpawnViolation(state, toolInput, reference, currentFingerprint) {
+  const assignment = state.reviewAssignments.find(
+    (entry) => entry.lane === reference.lane && entry.token === reference.token && entry.fingerprint === currentFingerprint,
+  );
+  if (assignment === undefined) return "VoltFlow rejected reviewer spawn: assignment is missing, stale, or belongs to a different lane.";
+  if (assignment.spawn !== undefined) return "VoltFlow rejected reviewer spawn: this assignment is already bound to another agent.";
+  const scope = typeof toolInput.message === "string" ? toolInput.message : "";
   if (toolInput.model === "gpt-5.6-sol" && namedSolReviewException(scope)) return null;
   if (toolInput.model === "gpt-5.6-terra" && toolInput.reasoning_effort === "high") return null;
   return "VoltFlow cost policy requires routine review agents to explicitly use model=gpt-5.6-terra and reasoning_effort=high. Sol review requires SOL_EXCEPTION with a named high-risk boundary or a direct user request.";
+}
+
+function bindReviewSpawn(state, input, currentFingerprint) {
+  if (!isRecord(input.tool_input)) return null;
+  const reference = reviewAssignmentReference(input.tool_input);
+  if (reference === null) return null;
+  const assignment = state.reviewAssignments.find(
+    (entry) => entry.lane === reference.lane && entry.token === reference.token && entry.fingerprint === currentFingerprint,
+  );
+  if (assignment === undefined || assignment.spawn !== undefined) return null;
+  const response = isRecord(input.tool_response) ? input.tool_response : {};
+  const agentId = typeof response.agent_id === "string" ? response.agent_id : typeof response.agentId === "string" ? response.agentId : null;
+  if (agentId === null) return { systemMessage: "VoltFlow could not bind the reviewer: the spawn response did not include an agent id." };
+  assignment.spawn = {
+    agentId,
+    model: typeof input.tool_input.model === "string" ? input.tool_input.model : "inherited-or-unknown",
+    reasoningEffort: typeof input.tool_input.reasoning_effort === "string" ? input.tool_input.reasoning_effort : "inherited-or-unknown",
+    at: timestamp(),
+  };
+  return null;
 }
 
 function namedSolReviewException(scope) {
@@ -502,7 +528,8 @@ function onPreToolUse(input, context) {
     return deny('VoltFlow requires v2 subagents to use fork_turns: "none".');
   }
   if (state?.active === true && input.tool_name.endsWith("spawn_agent") && isRecord(input.tool_input)) {
-    const violation = routineReviewSpawnViolation(input.tool_input);
+    const reference = reviewAssignmentReference(input.tool_input);
+    const violation = reference === null ? null : boundReviewSpawnViolation(state, input.tool_input, reference, context.fingerprint(input.cwd));
     if (violation !== null) return deny(violation);
   }
 
@@ -556,6 +583,7 @@ function onPostToolUseLocked(input, context) {
   const failed = toolFailed(input.tool_response);
   recordToolUsage(state, input, failed);
   const current = context.fingerprint(input.cwd);
+  const spawnBindingWarning = failed ? null : bindReviewSpawn(state, input, current);
   const recoveredViolation = recoverRevertedViolation(state, current);
 
   const editTool = typeof input.tool_name === "string" && isEditTool(input.tool_name);
@@ -610,7 +638,7 @@ function onPostToolUseLocked(input, context) {
   if (current !== null) state.lastFingerprint = current;
   state.updatedAt = timestamp();
   saveState(context.dataDir, state);
-  return valueWarning;
+  return valueWarning ?? spawnBindingWarning;
 }
 
 function onSubagentStart() {
@@ -646,6 +674,11 @@ function onSubagentStopLocked(input, context) {
     return { systemMessage: "VoltFlow ignored an unassigned or stale review receipt." };
   }
 
+  const agentId = typeof input.agent_id === "string" ? input.agent_id : "unknown";
+  if (assignment.spawn === undefined || assignment.spawn.agentId !== agentId) {
+    return { systemMessage: "VoltFlow ignored review receipt: it must come from the bound reviewer agent." };
+  }
+
   if (outcome === "FAIL") {
     state.reviewFailure = { lane, at: timestamp() };
     state.reviewPasses = [];
@@ -659,7 +692,6 @@ function onSubagentStopLocked(input, context) {
   if (blocker !== null) return { systemMessage: `VoltFlow ignored review pass: ${blocker}` };
   if (current === null) return { systemMessage: "VoltFlow ignored review pass: Git fingerprint unavailable." };
 
-  const agentId = typeof input.agent_id === "string" ? input.agent_id : "unknown";
   state.reviewPasses = state.reviewPasses.filter((entry) => entry.fingerprint === current);
   if (!state.reviewPasses.some((entry) => entry.agentId === agentId)) {
       state.reviewPasses.push({ agentId, lane, fingerprint: current, at: timestamp() });
@@ -930,6 +962,15 @@ function validReviewAssignment(value) {
     && typeof value.lane === "string"
     && typeof value.token === "string"
     && typeof value.fingerprint === "string"
+    && typeof value.at === "string"
+    && (value.spawn === undefined || validReviewSpawn(value.spawn));
+}
+
+function validReviewSpawn(value) {
+  return isRecord(value)
+    && typeof value.agentId === "string"
+    && typeof value.model === "string"
+    && typeof value.reasoningEffort === "string"
     && typeof value.at === "string";
 }
 

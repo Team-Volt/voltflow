@@ -116,6 +116,22 @@ function review(fx, agentId, lane) {
   assert.equal(assigned.exitCode, 0, assigned.stderr);
   const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
   assert.ok(token);
+  const toolInput = {
+    task_name: "checker",
+    message: `VOLTFLOW_REVIEW_ASSIGNMENT: ${lane} ${token}`,
+    fork_turns: "none",
+    model: "gpt-5.6-terra",
+    reasoning_effort: "high",
+  };
+  assert.equal(handleHook(input("PreToolUse", { tool_name: "agentsspawn_agent", tool_input: toolInput }), fx.options), null);
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "agentsspawn_agent",
+      tool_input: toolInput,
+      tool_response: { agent_id: agentId },
+    }),
+    fx.options,
+  );
   return handleHook(
     input("SubagentStop", {
       agent_id: agentId,
@@ -584,11 +600,24 @@ test("routine review agents require Terra high unless a named Sol exception appl
   handleHook(input("UserPromptSubmit", { prompt: "Review the parser" }), fx.options);
   start(fx, { tier: "standard", tdd: "exempt", review: "single" });
 
+  const validated = runController(
+    ["validate", "--session", "session-1", "--evidence", "closest relevant check passed"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(validated.exitCode, 0, validated.stderr);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(assigned.exitCode, 0, assigned.stderr);
+  const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
+  assert.ok(token);
+
   const reviewSpawn = (model, reasoningEffort, message) => handleHook(
     input("PreToolUse", {
       tool_name: "agentsspawn_agent",
       tool_input: {
-        task_name: "reviewer",
+        task_name: "checker",
         message,
         fork_turns: "none",
         model,
@@ -598,18 +627,73 @@ test("routine review agents require Terra high unless a named Sol exception appl
     fx.options,
   );
 
-  const denied = reviewSpawn("gpt-5.6-sol", "high", "WORK LAYER: review");
+  const assignment = `VOLTFLOW_REVIEW_ASSIGNMENT: composite ${token}`;
+  const denied = reviewSpawn("gpt-5.6-sol", "high", assignment);
   assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /gpt-5\.6-terra.*high/i);
-  assert.equal(reviewSpawn("gpt-5.6-terra", "high", "WORK LAYER: review"), null);
+  assert.equal(reviewSpawn("gpt-5.6-terra", "high", assignment), null);
+});
+
+test("review receipts require the agent and profile bound to an explicit assignment", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Review the parser" }), fx.options);
+  start(fx, { tier: "standard", tdd: "exempt", review: "single" });
+  const validated = runController(
+    ["validate", "--session", "session-1", "--evidence", "closest relevant check passed"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(validated.exitCode, 0, validated.stderr);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: "/repo" },
+  );
+  const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
+  assert.ok(token);
+  const toolInput = {
+    task_name: "inspection",
+    message: `VOLTFLOW_REVIEW_ASSIGNMENT: composite ${token}`,
+    fork_turns: "none",
+    model: "gpt-5.6-terra",
+    reasoning_effort: "high",
+  };
+  assert.equal(handleHook(input("PreToolUse", { tool_name: "agentsspawn_agent", tool_input: toolInput }), fx.options), null);
+  handleHook(
+    input("PostToolUse", { tool_name: "agentsspawn_agent", tool_input: toolInput, tool_response: { agent_id: "bound-agent" } }),
+    fx.options,
+  );
+  assert.deepEqual(loadState(fx.dataDir, "session-1").reviewAssignments[0].spawn, {
+    agentId: "bound-agent",
+    model: "gpt-5.6-terra",
+    reasoningEffort: "high",
+    at: loadState(fx.dataDir, "session-1").reviewAssignments[0].spawn.at,
+  });
+
+  const wrongAgent = handleHook(
+    input("SubagentStop", {
+      agent_id: "other-agent",
+      last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${token}`,
+    }),
+    fx.options,
+  );
+  assert.match(wrongAgent.systemMessage, /bound reviewer agent/i);
+  assert.equal(loadState(fx.dataDir, "session-1").approval, null);
+
   assert.equal(
-    reviewSpawn("gpt-5.6-sol", "high", "WORK LAYER: review\nSOL_EXCEPTION: authorization boundary"),
+    handleHook(
+      input("SubagentStop", {
+        agent_id: "bound-agent",
+        last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${token}`,
+      }),
+      fx.options,
+    ),
     null,
   );
-  assert.equal(
-    reviewSpawn("gpt-5.6-sol", "high", "WORK LAYER: review\nSOL_EXCEPTION: direct user request"),
-    null,
-  );
+  assert.equal(loadState(fx.dataDir, "session-1").approval.source, "subagent");
+});
+
+test("installed PostToolUse hook captures every tool category", () => {
+  const hooks = JSON.parse(readFileSync(new URL("../hooks/hooks.json", import.meta.url), "utf8"));
+  assert.equal(hooks.hooks.PostToolUse[0].matcher, "*");
 });
 
 function productionPatchDecision(fx) {
@@ -765,6 +849,29 @@ test("review receipts require a fingerprint-bound assignment token", () => {
   assert.equal(assigned.exitCode, 0, assigned.stderr);
   const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
   assert.ok(token);
+  const reviewToolInput = {
+    task_name: "checker",
+    message: `VOLTFLOW_REVIEW_ASSIGNMENT: correctness-security ${token}`,
+    fork_turns: "none",
+    model: "gpt-5.6-terra",
+    reasoning_effort: "high",
+  };
+  handleHook(
+    input("SubagentStop", {
+      agent_id: "reviewer-1",
+      last_assistant_message: `VOLTFLOW_REVIEW: PASS correctness-security ${token}`,
+    }),
+    fx.options,
+  );
+  assert.equal(loadState(fx.dataDir, "session-1").reviewPasses.length, 0);
+  handleHook(
+    input("PostToolUse", {
+      tool_name: "agentsspawn_agent",
+      tool_input: reviewToolInput,
+      tool_response: { agent_id: "reviewer-1" },
+    }),
+    fx.options,
+  );
   handleHook(
     input("SubagentStop", {
       agent_id: "reviewer-1",
@@ -845,6 +952,25 @@ test("concurrent split reviews retain both receipts", async () => {
   const validationToken = /token=(\S+)/.exec(validation.stdout)?.[1];
   assert.ok(correctnessToken, correctness.stderr);
   assert.ok(validationToken, validation.stderr);
+  for (const [lane, token, agentId] of [
+    ["correctness-security", correctnessToken, "reviewer-a"],
+    ["validation-scope", validationToken, "reviewer-b"],
+  ]) {
+    handleHook({
+      hook_event_name: "PostToolUse",
+      session_id: "parallel",
+      cwd: root,
+      tool_name: "agentsspawn_agent",
+      tool_input: {
+        task_name: "checker",
+        message: `VOLTFLOW_REVIEW_ASSIGNMENT: ${lane} ${token}`,
+        fork_turns: "none",
+        model: "gpt-5.6-terra",
+        reasoning_effort: "high",
+      },
+      tool_response: { agent_id: agentId },
+    }, { dataDir });
+  }
   await Promise.all([
     hookProcess(root, dataDir, {
       hook_event_name: "SubagentStop",
