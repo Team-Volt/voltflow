@@ -148,6 +148,11 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /external permission/i);
   assert.match(output.hookSpecificOutput.additionalContext, /theoretical edge cases are advisory/i);
   assert.match(output.hookSpecificOutput.additionalContext, /safe and satisfies the requested scope/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /subagent.*capacity/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /3, 6, and 9 seconds/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /9-second cap/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /at most ten/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /same assignment/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
