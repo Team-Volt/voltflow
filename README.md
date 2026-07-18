@@ -37,11 +37,13 @@ The bootstrap router uses five profiles:
 | --- | --- |
 | Discovery, tests, mechanical edits | Luna high |
 | Standard implementation | Terra max |
-| Planning, integration, composite review | Sol medium |
-| Routine adversarial or correctness review | Sol high |
+| Planning and integration | Sol medium |
+| Routine adversarial or correctness review | Terra high |
 | Security, architecture, migrations, difficult ambiguity | Sol max |
 
 Direct `model` and `reasoning_effort` overrides are used when the active spawn schema supports them. Otherwise VoltFlow selects a matching agent profile when possible; if neither route exists, it inherits the parent and reports `routing degraded` instead of pretending the requested profile ran.
+
+Routine review-only agents are cost-controlled: they must explicitly use Terra high. Sol is reserved for a named authorization, private-data, payment, booking, destructive/data-integrity migration, or cross-cutting-architecture risk, or a direct user request.
 
 This table starts from the community [Codex quota frontier analysis](https://www.reddit.com/r/codex/comments/1ut3bnp/the_codex_pareto_frontier_luna_high_terra_max_sol/), checked against the different [Artificial Analysis API-cost frontier](https://artificialanalysis.ai/articles/gpt-5-6-intelligence-vs-cost-across-sol-terra-luna). It is a prior, not a permanent benchmark result. OpenAI's [GPT-5.6 prompt guidance](https://developers.openai.com/api/docs/guides/prompt-guidance-gpt-5p6) supplies the prompt shape: one outcome, explicit constraints, evidence, and a stopping condition, with each rule stated once.
 
