@@ -22,7 +22,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const TIERS = new Set(["trivial", "standard", "high"]);
 const TDD_MODES = new Set(["required", "exempt"]);
 const REVIEW_MODES = new Set(["self", "single", "split"]);
-const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "review", "approve", "status"]);
+const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "integrate", "review", "approve", "status"]);
 const SPLIT_LANES = new Set(["correctness-security", "validation-scope"]);
 const REVIEW_RANK = { self: 0, single: 1, split: 2 };
 const TIER_RANK = { trivial: 0, standard: 1, high: 2 };
@@ -53,10 +53,11 @@ const OVERRIDE_INTENT = /^\s*(?:(?:voltflow[:,]?\s+)?(?:please\s+)?(?:override|b
 const OVERRIDE_QUESTION = /^\s*(?:how|what|when|where|why|who|(?:can|could|should|would|do)\s+(?:i|we)|is\s+it)\b/i;
 const OVERRIDE_NEGATION = /\b(?:do\s+not|don't|dont|never)\s+(?:\w+\s+){0,2}(?:override|bypass|ignore|overrule|waive|deploy|release|ship)\b/i;
 const USAGE = [
-  "Usage: voltflow.mjs start|skip|red|validate|review|approve|status|gate --session <id>",
+  "Usage: voltflow.mjs start|skip|red|validate|integrate|review|approve|status|gate --session <id>",
   "start: --tier trivial|standard|high --tdd required|exempt --review self|single|split",
   "skip: --evidence <reason> (simple work only, before any change)",
   "red|validate: --evidence <text>",
+  "integrate: --from <validated worker worktree>",
   "review: --lane composite|correctness-security|validation-scope",
   "approve: --self --evidence <text>",
 ].join("\n");
@@ -205,6 +206,25 @@ export function runController(argv, options = {}) {
     return success("VoltFlow validation recorded");
   }
 
+  if (command === "integrate") {
+    if (typeof flags.from !== "string") return failure("integrate requires --from <worker worktree>");
+    const source = loadState(dataDir, sessionId, flags.from);
+    if (source === null || !sameRepository(cwd, source.cwd) || sameWorkspace(cwd, source.cwd)) {
+      return failure("integration source must be a linked worktree in the same Git repository");
+    }
+    if ((source.workflowId ?? source.promptHash) !== (state.workflowId ?? state.promptHash)) {
+      return failure("integration source belongs to a different workflow");
+    }
+    const sourceFingerprint = fingerprint(source.cwd);
+    const blocker = evidenceBlocker(source, sourceFingerprint);
+    if (blocker !== null) return failure(`integration source is not ready: ${blocker}`);
+    state.red = evidence(`validated worker evidence from ${source.cwd}`, currentFingerprint);
+    state.redObserved = state.red;
+    state.updatedAt = timestamp();
+    saveState(dataDir, state);
+    return success("VoltFlow integration evidence adopted");
+  }
+
   if (command === "review") {
     const allowed = state.reviewMode === "single" ? new Set(["composite"]) : SPLIT_LANES;
     if (!allowed.has(flags.lane)) return failure(`review lane is invalid for review=${state.reviewMode}`);
@@ -229,7 +249,14 @@ export function runController(argv, options = {}) {
   }
 
   if (command === "status") {
-    if (state !== loaded) saveState(dataDir, state);
+    if (flags.agent !== undefined) {
+      if (typeof flags.agent !== "string" || !/^[a-z0-9_-]{1,128}$/i.test(flags.agent)) {
+        return failure("--agent must contain only letters, numbers, underscores, or hyphens");
+      }
+      state.agentIds ??= [];
+      if (!state.agentIds.includes(flags.agent)) state.agentIds.push(flags.agent);
+    }
+    if (state !== loaded || flags.agent !== undefined) saveState(dataDir, state);
     return success(JSON.stringify(state, null, 2));
   }
 
@@ -382,7 +409,7 @@ function deploymentOverrideReason(prompt) {
 
 function onPreToolUse(input, context) {
   if (typeof input.session_id !== "string" || typeof input.cwd !== "string" || typeof input.tool_name !== "string") return null;
-  const workspace = hookWorkspace(input);
+  const workspace = hookWorkspace(input, context);
   if (workspace.error !== null) return deny(`VoltFlow blocked the tool: ${workspace.error}`);
   if (workspace.unmanaged === true) return null;
   const state = withStateLock(context.dataDir, input.session_id, () => {
@@ -456,7 +483,7 @@ function onPostToolUse(input, context) {
 
 function onPostToolUseLocked(input, context) {
   if (typeof input.session_id !== "string" || typeof input.cwd !== "string") return null;
-  const workspace = hookWorkspace(input);
+  const workspace = hookWorkspace(input, context);
   if (workspace.error !== null) return null;
   if (workspace.unmanaged === true) return null;
   const state = loadState(context.dataDir, input.session_id, workspace.cwd);
@@ -520,12 +547,14 @@ function onPostToolUseLocked(input, context) {
 }
 
 function onSubagentStart(input, context) {
-  const prefix = typeof input.session_id === "string" ? controllerPrefix(context, input.session_id) : null;
+  const prefix = typeof input.session_id === "string"
+    ? controllerPrefix(context, input.session_id, typeof input.agent_id === "string" ? input.agent_id : null)
+    : null;
   return {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        `VoltFlow subtask contract: ${prefix === null ? "" : `run ${prefix} from the assigned worktree; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
+        `VoltFlow subtask contract: ${prefix === null ? "" : `run ${prefix} from the assigned worktree; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
     },
   };
 }
@@ -652,6 +681,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     stopBlocks: 0,
     reworkCycles: 0,
     valueWarningIssued: false,
+    agentIds: [],
     lastFingerprint: currentFingerprint,
     createdAt: timestamp(),
     updatedAt: timestamp(),
@@ -753,6 +783,7 @@ function validState(value, sessionId) {
     && typeof value.tddViolation === "boolean"
     && (value.reworkCycles === undefined || Number.isInteger(value.reworkCycles))
     && (value.valueWarningIssued === undefined || typeof value.valueWarningIssued === "boolean")
+    && (value.agentIds === undefined || Array.isArray(value.agentIds) && value.agentIds.every((entry) => typeof entry === "string"))
     && ["unclassified", ...TIERS].includes(value.tier)
     && ["unclassified", ...TDD_MODES].includes(value.tdd)
     && ["unclassified", ...REVIEW_MODES].includes(value.reviewMode)
@@ -872,8 +903,11 @@ function editedPaths(toolInput) {
   return [...new Set([...direct, ...paths])];
 }
 
-function hookWorkspace(input) {
-  const base = input.cwd;
+function hookWorkspace(input, context) {
+  const assigned = typeof input.session_id === "string" && typeof input.agent_id === "string"
+    ? loadSessionStates(context.dataDir, input.session_id).find((state) => state.agentIds?.includes(input.agent_id))
+    : undefined;
+  const base = assigned?.cwd ?? input.cwd;
   const workdirs = new Set(workdirsFrom(input.tool_input).map((workdir) => {
     const resolved = path.resolve(base, workdir);
     return gitWorktreeRoot(resolved) ?? canonicalPath(resolved);
@@ -1009,7 +1043,7 @@ function nestedExecInputs(source) {
 function toolFailed(response) {
   if (typeof response === "string") {
     if (/^Success\b/i.test(response) || /\b0\s+failed\b/i.test(response)) return false;
-    const exit = /(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?|exit_code)\D*(-?\d+)/i.exec(response);
+    const exit = /(?:^|\n)\s*(?:Process\s+)?(?:exited(?:\s+with)?(?:\s+code)?|exit(?:\s+code)?|exit_code)\s*[:=]?\s*(-?\d+)(?:\s|$)/im.exec(response);
     if (exit !== null) return Number(exit[1]) !== 0;
     return /\b[1-9]\d*\s+failed\b|\b(?:error|failure)\b/i.test(response);
   }
@@ -1147,9 +1181,10 @@ function historicalRed(state) {
   return state.redObserved ?? state.red;
 }
 
-function controllerPrefix(context, sessionId) {
+function controllerPrefix(context, sessionId, agentId = null) {
   const script = path.join(context.pluginRoot, "scripts", "voltflow.mjs");
-  return `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(sessionId)}`;
+  const agent = agentId === null ? "" : ` --agent ${quote(agentId)}`;
+  return `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(sessionId)}${agent}`;
 }
 
 function quote(value) {
