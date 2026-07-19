@@ -134,7 +134,7 @@ export function runController(argv, options = {}) {
       state.tier = flags.tier;
       state.reviewMode = flags.review;
       state.updatedAt = timestamp();
-      saveState(dataDir, state);
+      saveStartedState(dataDir, state);
       return success(`VoltFlow updated: ${flags.tier}, tdd=${flags.tdd}, review=${flags.review}`);
     }
     Object.assign(state, {
@@ -160,7 +160,7 @@ export function runController(argv, options = {}) {
       valueWarningIssued: false,
       updatedAt: timestamp(),
     });
-    saveState(dataDir, state);
+    saveStartedState(dataDir, state);
     return success(`VoltFlow started: ${flags.tier}, tdd=${flags.tdd}, review=${flags.review}`);
   }
 
@@ -738,6 +738,22 @@ function saveState(dataDir, state) {
   const temporary = `${file}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, file);
+}
+
+function saveStartedState(dataDir, state) {
+  saveState(dataDir, state);
+  const workflowId = state.workflowId ?? state.promptHash;
+  for (const related of relatedStates(dataDir, state.sessionId, state.cwd)) {
+    if ((related.workflowId ?? related.promptHash) !== workflowId) continue;
+    Object.assign(related, {
+      active: true,
+      tier: state.tier,
+      tdd: state.tdd,
+      reviewMode: state.reviewMode,
+      updatedAt: timestamp(),
+    });
+    saveState(dataDir, related);
+  }
 }
 
 function withStateLock(dataDir, sessionId, operation) {
