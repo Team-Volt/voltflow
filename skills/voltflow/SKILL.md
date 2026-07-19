@@ -45,6 +45,8 @@ Read [references/routing.md](references/routing.md) before spawning. Scale concu
 
 When the active spawn schema is v2, always set `fork_turns: "none"`. Never use full-history inheritance, including when overriding `model` or `reasoning_effort`.
 
+Never select `ultra` reasoning for a subagent. Do not use a pinned profile or inherit the parent unless its effort is known and not `ultra`; refuse the spawn when no compliant route exists. If the user explicitly requests `ultra`, report the policy conflict instead of substituting another effort.
+
 Each spawn prompt contains five labeled fields and nothing repetitive:
 
 - `WORK LAYER`: discovery, planning, implementation, validation, or review.

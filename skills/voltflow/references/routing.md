@@ -8,9 +8,9 @@ Inspect the active spawn schema before delegating. Treat its model descriptions 
 | --- | --- | --- |
 | Mechanical, read-heavy, repetitive, or easy to verify | Fastest capable model | Low or medium |
 | Bounded implementation with clear acceptance checks | Balanced coding model | Medium or high |
-| Ambiguous planning, difficult debugging, or cross-cutting integration | Strongest suitable model | High or above |
+| Ambiguous planning, difficult debugging, or cross-cutting integration | Strongest suitable model | High, xhigh, or max |
 | Adversarial or holistic review | Capable reviewer, preferably configured differently from the author | Scale with ambiguity and the strength of deterministic checks |
-| Named high-risk boundary where a miss is expensive | Strongest suitable model | High or above |
+| Named high-risk boundary where a miss is expensive | Strongest suitable model | High, xhigh, or max |
 
 ## Routing rules
 
@@ -18,17 +18,18 @@ Inspect the active spawn schema before delegating. Treat its model descriptions 
 2. The main session owns the selection. Set `model` and `reasoning_effort` directly when the spawn schema exposes them, and omit `service_tier` unless the user requests one.
 3. For independent review, prefer a model or reasoning configuration different from the author when available. Raise capability or effort only when the review scope, uncertainty, or named risk justifies it.
 4. Named high-risk boundaries include authorization, private data, payments, bookings, destructive or data-integrity migrations, and cross-cutting architecture. They establish a higher selection floor without prescribing one model family.
-5. Honor an explicit user selection. If the requested model or effort is unavailable, report that instead of silently substituting or downgrading it.
-6. If only `agent_type` is available, select the closest matching configured profile. If no override surface exists, inherit the parent and state `routing degraded` once in the result.
-7. Record the selected model, reasoning effort, and short task-based rationale in the assignment or result so routing decisions remain reviewable.
-8. Size each wave to the useful independent slices and the host's available concurrency. Do not create slices solely to increase agent count.
+5. Never select `ultra` reasoning for a subagent. If the user explicitly requests it, report the policy conflict instead of substituting another effort.
+6. Honor any other explicit user selection. If the requested model or effort is unavailable, report that instead of silently substituting or downgrading it.
+7. If only `agent_type` is available, select the closest matching profile whose effort is known and not `ultra`. If no override surface exists, inherit the parent only when its effort is known and not `ultra`; state `routing degraded` once in the result. If neither compliant route exists, refuse the spawn and state `routing blocked`.
+8. Record the selected model, reasoning effort, and short task-based rationale in the assignment or result so routing decisions remain reviewable.
+9. Size each wave to the useful independent slices and the host's available concurrency. Do not create slices solely to increase agent count.
 
 ## Spawn schema
 
 Inspect the active tool schema before spawning and use only fields it declares.
 
 - Multi-agent v1: call `multi_agent_v1.spawn_agent` with `message`, `fork_context: false`, and the chosen `model` and `reasoning_effort`. Add `agent_type` only when a matching role improves the assignment.
-- Multi-agent v2: always call the flat `spawn_agent` with `task_name`, `message`, and `fork_turns: "none"`. Never use full-history inheritance. Pass model settings only when the schema declares them; otherwise use a matching pinned profile or inherit the parent and report `routing degraded`.
+- Multi-agent v2: always call the flat `spawn_agent` with `task_name`, `message`, and `fork_turns: "none"`. Never use full-history inheritance. Pass model settings only when the schema declares them; otherwise use a verified non-ultra profile or parent and report `routing degraded`. Refuse the spawn when no compliant route exists.
 
 The hook workflow observes subagent lifecycle events rather than calling either API, so review collection does not depend on the spawn schema.
 

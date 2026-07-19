@@ -35,7 +35,9 @@ The main session selects a model and reasoning effort for each concrete assignme
 
 Mechanical work tends toward the fastest capable model at low or medium effort. Bounded implementation tends toward a balanced coding model at medium or high effort. Ambiguous integration, holistic review, and named high-risk boundaries justify stronger models or more reasoning. Independent reviewers should use a different model or reasoning configuration from the author when one is available.
 
-Direct `model` and `reasoning_effort` overrides are used when the active spawn schema supports them. Otherwise VoltFlow selects the closest matching agent profile when possible; if neither route exists, it inherits the parent and reports `routing degraded`. Explicit user selections are never silently substituted or downgraded.
+Direct `model` and `reasoning_effort` overrides are used when the active spawn schema supports them. Otherwise VoltFlow uses the closest matching profile or inherits the parent only when its effort is known and not `ultra`; these fallbacks report `routing degraded`. If no compliant route exists, VoltFlow refuses the spawn and reports `routing blocked`. Explicit user selections are never silently substituted or downgraded.
+
+VoltFlow never selects `ultra` reasoning for a subagent. An explicit `ultra` request is rejected as a policy conflict rather than replaced with another effort.
 
 The complete selection rubric is in [routing.md](skills/voltflow/references/routing.md). The chosen model, effort, and task-based rationale are recorded with the assignment or result so routing decisions remain reviewable.
 
@@ -44,7 +46,7 @@ The complete selection rubric is in [routing.md](skills/voltflow/references/rout
 VoltFlow does not call a subagent API from its Node runtime. The main Codex agent uses whichever host schema is available:
 
 - Multi-agent v1 uses the namespaced `multi_agent_v1.spawn_agent` fields, including direct `model` and `reasoning_effort` overrides.
-- Multi-agent v2 uses the flat `spawn_agent` shape with `task_name`, `message`, and `fork_turns: "none"`. VoltFlow never uses full-history inheritance for a v2 spawn. It passes model settings only when that schema exposes them; otherwise it uses the closest configured profile or reports degraded routing.
+- Multi-agent v2 uses the flat `spawn_agent` shape with `task_name`, `message`, and `fork_turns: "none"`. VoltFlow never uses full-history inheritance for a v2 spawn. It passes model settings only when that schema exposes them; otherwise it uses a verified non-ultra profile or parent, or refuses the spawn.
 
 The lifecycle hooks consume `SubagentStart` and `SubagentStop`, so review receipts are independent of the spawn API version. Both host schemas are supported; the active schema still determines whether direct model and reasoning overrides are available.
 
