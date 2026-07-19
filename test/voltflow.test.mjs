@@ -1171,6 +1171,20 @@ test("transparent wrappers and dotted unittest selectors record RED without pois
   assert.match(state.red.details, /python3 -m unittest/);
 });
 
+test("direct Python unittest files record RED with interpreter flags", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement task results" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "python3 -B tests/test_taskgraph.py -v" },
+    tool_response: { exit_code: 1, output: "Ran 1 test\nFAILED (failures=1)" },
+  }), fx.options);
+
+  assert.match(loadState(fx.dataDir, "session-1").red.details, /tests\/test_taskgraph\.py/);
+});
+
 test("desktop exec hooks route nested test RED to the command worktree", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);

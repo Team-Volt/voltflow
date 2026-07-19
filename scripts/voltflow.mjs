@@ -46,7 +46,7 @@ const DEFAULT_DEPLOY_PATTERNS = [
   /\btwine\b[^\n;&|]*\bupload\b/i,
   /\bgh\b[^\n;&|]*\brelease\b[^\n;&|]*\bcreate\b/i,
 ];
-const TEST_COMMAND = /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|^node\s+--test\b|^(?:pytest|vitest|jest|rspec|phpunit)\b|^python(?:3)?\s+-m\s+(?:pytest|unittest)\b|^(?:go|cargo|dotnet|swift|mix)\s+test\b|^(?:mvn|gradle|gradlew|xcodebuild)\b[^\n]*\btest\b/i;
+const TEST_COMMAND = /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|^node\s+--test\b|^(?:pytest|vitest|jest|rspec|phpunit)\b|^python(?:3)?(?:\s+-[a-z]+)*\s+(?:-m\s+(?:pytest|unittest)\b|(?:tests?\/\S+|(?:\S+\/)?test[^/\s]*)\.py\b)|^(?:go|cargo|dotnet|swift|mix)\s+test\b|^(?:mvn|gradle|gradlew|xcodebuild)\b[^\n]*\btest\b/i;
 const NON_EXECUTING_COMMANDS = /^(?:echo|printf|rg|grep|sed|cat|head|tail|less|man|type|which|whereis)$/i;
 const TEST_OUTPUT = /(?:^|\n)(?:TAP version|(?:not )?ok \d+\s+-|Ran \d+ tests?|FAILED \(|OK\s*$|=+ .* (?:passed|failed|error)|test result:|Tests run:|(?:Test Files|Tests):\s+.*(?:passed|failed)|(?:PASS|FAIL)\s+\S+\.(?:test|spec)\.)/im;
 const OVERRIDE_INTENT = /^\s*(?:(?:voltflow[:,]?\s+)?(?:please\s+)?(?:override|bypass|waive)\s+(?:the\s+)?(?:deployment\s+)?(?:gate|review|approval)\b[^\n]*\b(?:deploy|release|ship)\b|(?:voltflow[:,]?\s+)?(?:please\s+)?(?:deploy|release|ship)\b[^\n]{0,160}\b(?:anyway|regardless|despite|without\s+(?:a\s+|the\s+)?(?:review|approval|gate))\b[^\n]*)[.!]?\s*$/i;
