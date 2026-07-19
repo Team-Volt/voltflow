@@ -39,7 +39,7 @@ Direct `model` and `reasoning_effort` overrides are used when the active spawn s
 
 VoltFlow never selects `ultra` reasoning for a subagent. An explicit `ultra` request is rejected as a policy conflict rather than replaced with another effort.
 
-The complete selection rubric is in [routing.md](skills/voltflow/references/routing.md). The chosen model, effort, and task-based rationale are recorded with the assignment or result so routing decisions remain reviewable.
+The complete selection rubric is in [routing.md](skills/voltflow/references/routing.md). Before each spawn, the main session reports the chosen model, reasoning effort, and a one-sentence reason. The assignment records them, and the subagent repeats them in its first update, so the route remains understandable inside the subagent session even when Codex hides spawn metadata.
 
 ## Multi-agent compatibility
 

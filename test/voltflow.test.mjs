@@ -226,6 +226,7 @@ test("subagent contract limits per-slice TDD to required work", () => {
   assert.match(context, /syntax checks do not prove runtime behavior/i);
   assert.match(context, /ordinary documented use/i);
   assert.match(context, /safe and satisfies scope/i);
+  assert.match(context, /first user-visible update.*selected model, reasoning effort, and a one-sentence reason/i);
 });
 
 test("active v2 spawns require isolated context", () => {

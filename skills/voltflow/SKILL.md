@@ -56,10 +56,12 @@ Each spawn prompt contains five labeled fields and nothing repetitive:
 - `WORK LAYER`: discovery, planning, implementation, validation, or review.
 - `OUTCOME`: one observable result.
 - `SCOPE`: owned paths or review slice, plus explicit exclusions.
-- `EVIDENCE`: commands, files, or scenarios that prove the result.
+- `EVIDENCE`: the selected model, reasoning effort, and one-sentence routing rationale, followed by commands, files, or scenarios that prove the result.
 - `STOP`: the condition that ends work or requires escalation.
 
 Treat examples as examples, not hidden requirements. When instructions conflict, follow the user outcome, repository invariants, and the bounded assignment in that order. Return a concise result with evidence; do not invent neighboring work to make the assignment look complete.
+
+Before every spawn, tell the user which model and reasoning effort you selected and why in one sentence. The subagent's first user-visible update repeats that route and rationale from `EVIDENCE`, so its session stays understandable even when the host hides spawn metadata.
 
 ## Review in proportion to risk
 
