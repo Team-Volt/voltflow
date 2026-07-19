@@ -211,16 +211,21 @@ test("simple work can skip workflow ceremony without granting deployment approva
 });
 
 test("subagent contract limits per-slice TDD to required work", () => {
-  const output = handleHook(input("SubagentStart"));
-  assert.match(output.hookSpecificOutput.additionalContext, /when TDD is required/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /one behavior/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /one focused test/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /finish RED.*GREEN before starting the next slice/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /TDD-exempt work.*do not create tests/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /every changed observable layer/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /syntax checks do not prove runtime behavior/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /ordinary documented use/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /safe and satisfies scope/i);
+  const fx = fixture();
+  const output = handleHook(input("SubagentStart"), fx.options);
+  const context = output.hookSpecificOutput.additionalContext;
+  assert.match(context, /node '\/plugin\/scripts\/voltflow\.mjs' <command>/);
+  assert.match(context, new RegExp(`--data-dir '${fx.dataDir.replaceAll("/", "\\/")}'`));
+  assert.match(context, /--session 'session-1'/);
+  assert.match(context, /when TDD is required/i);
+  assert.match(context, /one behavior/i);
+  assert.match(context, /one focused test/i);
+  assert.match(context, /finish RED.*GREEN before starting the next slice/i);
+  assert.match(context, /TDD-exempt work.*do not create tests/i);
+  assert.match(context, /every changed observable layer/i);
+  assert.match(context, /syntax checks do not prove runtime behavior/i);
+  assert.match(context, /ordinary documented use/i);
+  assert.match(context, /safe and satisfies scope/i);
 });
 
 test("active v2 spawns require isolated context", () => {
@@ -311,6 +316,113 @@ test("one edit cannot span linked worktrees even when it supplies workdir", () =
   }), fx.options);
   assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
   assert.match(result.hookSpecificOutput.permissionDecisionReason, /span multiple Git worktrees/i);
+});
+
+test("edits outside Git bypass repository workflow state but cannot mix with it", () => {
+  const fx = worktreeFixture();
+  const external = path.join(mkdtempSync(path.join(tmpdir(), "voltflow-global-")), "SKILL.md");
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  assert.equal(handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: external },
+  }), fx.options), null);
+
+  const mixed = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: {
+      command: `*** Begin Patch\n*** Update File: ${path.join(fx.root, "README.md")}\n+repo\n*** Update File: ${external}\n+global\n*** End Patch`,
+    },
+  }), fx.options);
+  assert.equal(mixed.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(mixed.hookSpecificOutput.permissionDecisionReason, /span managed and external paths/i);
+});
+
+test("moving an external file into a managed worktree cannot bypass checks", () => {
+  const fx = worktreeFixture();
+  const external = path.join(mkdtempSync(path.join(tmpdir(), "voltflow-external-move-")), "source.txt");
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: {
+      command: `*** Begin Patch\n*** Update File: ${external}\n*** Move to: ${path.join(fx.root, "moved.txt")}\n@@\n-old\n+new\n*** End Patch`,
+    },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(result.hookSpecificOutput.permissionDecisionReason, /span managed and external paths/i);
+});
+
+test("an external symlink alias cannot bypass managed repository checks", () => {
+  const fx = worktreeFixture();
+  const alias = `${fx.root}-edit-alias`;
+  symlinkSync(fx.root, alias, "dir");
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(alias, "src", "new-file.mjs") },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(result.hookSpecificOutput.permissionDecisionReason, /failing test or reproduction/i);
+});
+
+test("an external file symlink cannot bypass managed repository checks", () => {
+  const fx = worktreeFixture();
+  const alias = `${fx.root}-readme-alias`;
+  symlinkSync(path.join(fx.root, "README.md"), alias, "file");
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: alias },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(result.hookSpecificOutput.permissionDecisionReason, /failing test or reproduction/i);
+});
+
+test("a managed symlink pointing outside cannot bypass repository checks", () => {
+  const fx = worktreeFixture();
+  const external = path.join(mkdtempSync(path.join(tmpdir(), "voltflow-external-target-")), "target.txt");
+  const linked = path.join(fx.root, "linked.txt");
+  writeFileSync(external, "external\n");
+  symlinkSync(external, linked, "file");
+  git(fx.root, "add", "linked.txt");
+  git(fx.root, "commit", "-qm", "add external link");
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: linked },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(result.hookSpecificOutput.permissionDecisionReason, /failing test or reproduction/i);
 });
 
 test("review receipts route to their assigned worktree state", () => {
@@ -830,6 +942,50 @@ test("only executed successful tests create validation evidence", () => {
     fx.options,
   );
   assert.equal(loadState(fx.dataDir, "session-1").validation, null);
+});
+
+test("transparent wrappers and dotted unittest selectors record RED without poisoning TDD", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement graph validation" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "exec_command",
+    tool_input: { cmd: "workspace-tool python3 -m unittest tests.test_graph.StageTests.test_cycle -v" },
+    tool_response: { exit_code: 1, output: "FAILED (failures=1)" },
+  }), { ...fx.options, fingerprint: () => "diff-b" });
+
+  const state = loadState(fx.dataDir, "session-1");
+  assert.equal(state.tddViolation, false);
+  assert.match(state.red.details, /python3 -m unittest/);
+});
+
+test("a wrapper cannot create RED without test-runner output", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement graph validation" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "exec_command",
+    tool_input: { cmd: "false node --test" },
+    tool_response: { exit_code: 1, output: "" },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1").red, null);
+});
+
+test("a wrapper setup failure cannot masquerade as test-runner output", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement graph validation" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "exec_command",
+    tool_input: { cmd: "workspace-tool python3 -m unittest tests.test_graph.StageTests.test_cycle -v" },
+    tool_response: { exit_code: 1, output: "FAIL: workspace unavailable" },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1").red, null);
 });
 
 test("review receipts require a fingerprint-bound assignment token", () => {

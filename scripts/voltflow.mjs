@@ -46,7 +46,9 @@ const DEFAULT_DEPLOY_PATTERNS = [
   /\btwine\b[^\n;&|]*\bupload\b/i,
   /\bgh\b[^\n;&|]*\brelease\b[^\n;&|]*\bcreate\b/i,
 ];
-const TEST_COMMAND = /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|^node\s+--test\b|^(?:pytest|vitest|jest|rspec|phpunit)\b|^python(?:3)?\s+-m\s+pytest\b|^(?:go|cargo|dotnet|swift|mix)\s+test\b|^(?:mvn|gradle|gradlew|xcodebuild)\b[^\n]*\btest\b/i;
+const TEST_COMMAND = /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|^node\s+--test\b|^(?:pytest|vitest|jest|rspec|phpunit)\b|^python(?:3)?\s+-m\s+(?:pytest|unittest)\b|^(?:go|cargo|dotnet|swift|mix)\s+test\b|^(?:mvn|gradle|gradlew|xcodebuild)\b[^\n]*\btest\b/i;
+const NON_EXECUTING_COMMANDS = /^(?:echo|printf|rg|grep|sed|cat|head|tail|less|man|type|which|whereis)$/i;
+const TEST_OUTPUT = /(?:^|\n)(?:TAP version|(?:not )?ok \d+\s+-|Ran \d+ tests?|FAILED \(|OK\s*$|=+ .* (?:passed|failed|error)|test result:|Tests run:|(?:Test Files|Tests):\s+.*(?:passed|failed)|(?:PASS|FAIL)\s+\S+\.(?:test|spec)\.)/im;
 const OVERRIDE_INTENT = /^\s*(?:(?:voltflow[:,]?\s+)?(?:please\s+)?(?:override|bypass|waive)\s+(?:the\s+)?(?:deployment\s+)?(?:gate|review|approval)\b[^\n]*\b(?:deploy|release|ship)\b|(?:voltflow[:,]?\s+)?(?:please\s+)?(?:deploy|release|ship)\b[^\n]{0,160}\b(?:anyway|regardless|despite|without\s+(?:a\s+|the\s+)?(?:review|approval|gate))\b[^\n]*)[.!]?\s*$/i;
 const OVERRIDE_QUESTION = /^\s*(?:how|what|when|where|why|who|(?:can|could|should|would|do)\s+(?:i|we)|is\s+it)\b/i;
 const OVERRIDE_NEGATION = /\b(?:do\s+not|don't|dont|never)\s+(?:\w+\s+){0,2}(?:override|bypass|ignore|overrule|waive|deploy|release|ship)\b/i;
@@ -71,7 +73,7 @@ export function handleHook(input, options = {}) {
     case "PostToolUse":
       return onPostToolUse(input, context);
     case "SubagentStart":
-      return onSubagentStart();
+      return onSubagentStart(input, context);
     case "SubagentStop":
       return onSubagentStop(input, context);
     case "Stop":
@@ -358,8 +360,7 @@ function onUserPromptLocked(input, context) {
     }
   }
 
-  const script = path.join(context.pluginRoot, "scripts", "voltflow.mjs");
-  const prefix = `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(input.session_id)}`;
+  const prefix = controllerPrefix(context, input.session_id);
   const configNote = context.configError === null ? "" : ` Config warning: ${context.configError}`;
   return userContext(
     `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
@@ -382,6 +383,7 @@ function onPreToolUse(input, context) {
   if (typeof input.session_id !== "string" || typeof input.cwd !== "string" || typeof input.tool_name !== "string") return null;
   const workspace = hookWorkspace(input);
   if (workspace.error !== null) return deny(`VoltFlow blocked the tool: ${workspace.error}`);
+  if (workspace.unmanaged === true) return null;
   const state = withStateLock(context.dataDir, input.session_id, () => {
     const existing = loadState(context.dataDir, input.session_id, workspace.cwd);
     const related = relatedState(context.dataDir, input.session_id, workspace.cwd);
@@ -455,6 +457,7 @@ function onPostToolUseLocked(input, context) {
   if (typeof input.session_id !== "string" || typeof input.cwd !== "string") return null;
   const workspace = hookWorkspace(input);
   if (workspace.error !== null) return null;
+  if (workspace.unmanaged === true) return null;
   const state = loadState(context.dataDir, input.session_id, workspace.cwd);
   if (state?.active !== true) return null;
   const failed = toolFailed(input.tool_response);
@@ -465,14 +468,17 @@ function onPostToolUseLocked(input, context) {
   const command = typeof input.tool_name === "string" && isCommandTool(input.tool_name)
     ? commandFrom(input.tool_input)
     : null;
+  const testCommand = command !== null && isTestCommand(command, input.tool_response);
   const fingerprintChanged = current !== null && state.lastFingerprint !== null && current !== state.lastFingerprint;
   let valueWarning = null;
   if ((!failed && editTool) || fingerprintChanged) {
     const paths = editedPaths(input.tool_input);
     const testOnlyEdit = editTool && paths.length > 0 && paths.every(isTestPath);
-    const touchesTest = (editTool && paths.some(isTestPath)) || (command !== null && commandMentionsTestPath(command));
-    const touchesProduction = (editTool && paths.some((file) => !isTestPath(file)))
-      || (command !== null && commandMentionsProductionPath(command));
+    const touchesTest = testCommand || (editTool && paths.some(isTestPath)) || (command !== null && commandMentionsTestPath(command));
+    const touchesProduction = !testCommand && (
+      (editTool && paths.some((file) => !isTestPath(file)))
+      || (command !== null && commandMentionsProductionPath(command))
+    );
     if (
       state.validation?.fingerprint === state.lastFingerprint
       && !testOnlyEdit
@@ -484,7 +490,7 @@ function onPostToolUseLocked(input, context) {
         valueWarning = { systemMessage: VALUE_WARNING };
       }
     }
-    if (state.tdd === "required" && state.red === null && state.tddViolation !== true && !testOnlyEdit && !recoveredViolation) {
+    if (state.tdd === "required" && state.red === null && state.tddViolation !== true && !testOnlyEdit && !testCommand && !recoveredViolation) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
     }
@@ -499,7 +505,7 @@ function onPostToolUseLocked(input, context) {
     invalidateForChange(state);
   }
 
-  if (command !== null && isTestCommand(command)) {
+  if (testCommand) {
     if (failed && state.tdd === "required" && state.tddViolation !== true) {
       state.red = evidence(command, current);
       state.redObserved = state.red;
@@ -512,12 +518,13 @@ function onPostToolUseLocked(input, context) {
   return valueWarning;
 }
 
-function onSubagentStart() {
+function onSubagentStart(input, context) {
+  const prefix = typeof input.session_id === "string" ? controllerPrefix(context, input.session_id) : null;
   return {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        "VoltFlow subtask contract: stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.",
+        `VoltFlow subtask contract: ${prefix === null ? "" : `run ${prefix} from the assigned worktree; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
     },
   };
 }
@@ -860,23 +867,27 @@ function editedPaths(toolInput) {
       ? toolInput.patch
       : commandFrom(toolInput);
   if (patch === null) return direct;
-  const paths = [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)].map((match) => match[1].trim());
+  const paths = [...patch.matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File:|Move to:)\s*(.+)$/gm)].map((match) => match[1].trim());
   return [...new Set([...direct, ...paths])];
 }
 
 function hookWorkspace(input) {
   const base = input.cwd;
   if (!isEditTool(input.tool_name) && isRecord(input.tool_input) && typeof input.tool_input.workdir === "string") {
-    return { cwd: path.resolve(base, input.tool_input.workdir), error: null };
+    return { cwd: path.resolve(base, input.tool_input.workdir), error: null, unmanaged: false };
   }
-  if (!isEditTool(input.tool_name)) return { cwd: base, error: null };
+  if (!isEditTool(input.tool_name)) return { cwd: base, error: null, unmanaged: false };
   const baseRoot = gitWorktreeRoot(base);
-  if (baseRoot === null) return { cwd: base, error: null };
-  const roots = new Set(editedPaths(input.tool_input)
-    .map((file) => gitWorktreeRoot(path.resolve(base, file)))
-    .filter((root) => root !== null));
-  if (roots.size > 1) return { cwd: base, error: "one edit cannot span multiple Git worktrees" };
-  return { cwd: roots.values().next().value ?? baseRoot, error: null };
+  if (baseRoot === null) return { cwd: base, error: null, unmanaged: false };
+  const paths = editedPaths(input.tool_input);
+  const resolvedRoots = paths.map((file) => gitWorktreeRoot(path.resolve(base, file)));
+  const roots = new Set(resolvedRoots.filter((root) => root !== null));
+  if (roots.size > 1) return { cwd: base, error: "one edit cannot span multiple Git worktrees", unmanaged: false };
+  if (roots.size > 0 && resolvedRoots.includes(null)) {
+    return { cwd: base, error: "one edit cannot span managed and external paths", unmanaged: false };
+  }
+  if (paths.length > 0 && roots.size === 0) return { cwd: base, error: null, unmanaged: true };
+  return { cwd: roots.values().next().value ?? baseRoot ?? base, error: null, unmanaged: false };
 }
 
 function isTestPath(file) {
@@ -884,10 +895,23 @@ function isTestPath(file) {
   return /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^/]+$/.test(normalized);
 }
 
-function isTestCommand(command) {
+function isTestCommand(command, response) {
   if (/&&|\|\||[|;&\n]/.test(command)) return false;
   const segments = shellSegments(command);
-  return segments.length === 1 && TEST_COMMAND.test(segments[0].trim());
+  if (segments.length !== 1) return false;
+  const segment = segments[0].trim();
+  if (TEST_COMMAND.test(segment)) return true;
+  const [wrapper, ...rest] = segment.split(/\s+/);
+  return rest.length > 0
+    && !NON_EXECUTING_COMMANDS.test(wrapper)
+    && TEST_COMMAND.test(rest.join(" "))
+    && TEST_OUTPUT.test(toolResponseText(response));
+}
+
+function toolResponseText(response) {
+  if (typeof response === "string") return response;
+  if (!isRecord(response)) return "";
+  return [response.output, response.stdout, response.stderr].filter((value) => typeof value === "string").join("\n");
 }
 
 function shellSegments(command) {
@@ -1075,6 +1099,11 @@ function historicalRed(state) {
   return state.redObserved ?? state.red;
 }
 
+function controllerPrefix(context, sessionId) {
+  const script = path.join(context.pluginRoot, "scripts", "voltflow.mjs");
+  return `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(sessionId)}`;
+}
+
 function quote(value) {
   return process.platform === "win32"
     ? `'${value.replaceAll("'", "''")}'`
@@ -1113,22 +1142,40 @@ function sameRepository(left, right) {
 }
 
 function gitWorktreeRoot(value) {
-  const directory = nearestExistingDirectory(value);
-  const result = git(directory, ["rev-parse", "--show-toplevel"]);
+  const result = gitMetadata(value, ["rev-parse", "--show-toplevel"]);
   return result.ok ? canonicalPath(result.stdout.trim()) : null;
 }
 
 function gitCommonDirectory(value) {
-  const directory = nearestExistingDirectory(value);
-  const result = git(directory, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const result = gitMetadata(value, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
   return result.ok ? canonicalPath(result.stdout.trim()) : null;
+}
+
+function gitMetadata(value, args) {
+  let current = path.resolve(value);
+  while (true) {
+    if (existsSync(current)) {
+      try {
+        if (statSync(current).isDirectory()) {
+          const result = git(current, args);
+          if (result.ok) return result;
+        }
+      } catch {
+        // Continue through lexical parents when a path cannot be resolved.
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return git(nearestExistingDirectory(value), args);
 }
 
 function nearestExistingDirectory(value) {
   let current = path.resolve(value);
   while (!existsSync(current) && path.dirname(current) !== current) current = path.dirname(current);
-  if (existsSync(current) && !lstatSync(current).isDirectory()) return path.dirname(current);
-  return current;
+  const canonical = canonicalPath(current);
+  return statSync(canonical).isDirectory() ? canonical : path.dirname(canonical);
 }
 
 function canonicalPath(value) {

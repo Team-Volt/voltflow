@@ -43,6 +43,8 @@ Record successful automated or manual validation with the controller. A passing 
 
 Read [references/routing.md](references/routing.md) before spawning. Scale concurrent subagents to the number of useful independent slices and the host's available capacity. Parallel writers need disjoint owned paths; serialize shared files and dependencies.
 
+The `SubagentStart` hook supplies the exact controller prefix, including protected data and session arguments. Run it from the assigned worktree. Before mutating a newly created integration worktree, run the controller's `status` command there so its inherited baseline exists even when the host's command hook does not expose the tool's actual workdir.
+
 When the active spawn schema is v2, always set `fork_turns: "none"`. Never use full-history inheritance, including when overriding `model` or `reasoning_effort`.
 
 Never select `ultra` reasoning for a subagent. Do not use a pinned profile or inherit the parent unless its effort is known and not `ultra`; refuse the spawn when no compliant route exists. If the user explicitly requests `ultra`, report the policy conflict instead of substituting another effort.
@@ -66,6 +68,8 @@ Review the final diff against the request, not against an imagined ideal rewrite
 - `split`: two reviewers use non-overlapping lanes: correctness/security and validation/scope.
 
 Before spawning each independent reviewer, run the injected controller with `review --lane <lane>`. Put the returned token in the review prompt. The reviewer ends with `VOLTFLOW_REVIEW: PASS <lane> <token>` only when no blocking finding remains, or `VOLTFLOW_REVIEW: FAIL <lane> <token>` after its findings. Receipts without a current assignment are ignored, a failed lane clears earlier passes, and any edit invalidates every receipt.
+
+Reviewers must remove only generated artifacts created by their validation, or prevent them with the project's existing no-write option, before returning the receipt. Validation and approval remain worktree-local, so perform final validation and review in the worktree that will pass the deployment gate.
 
 ### Bound review exploration
 
