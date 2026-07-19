@@ -54,6 +54,14 @@ VoltFlow does not call a subagent API from its Node runtime. The main Codex agen
 
 The lifecycle hooks consume `SubagentStart` and `SubagentStop`, so review receipts are independent of the spawn API version. Both host schemas are supported; the active schema still determines whether direct model and reasoning overrides are available.
 
+### Git worktrees
+
+VoltFlow supports subagents working in linked Git worktrees under one Codex task. The main agent still creates each worktree, assigns its branch and path, integrates the result, and removes the worktree when it is no longer needed.
+
+Command tools select a worktree from their `workdir`; edit tools select it from the paths they change. A linked worktree inherits the active tier, TDD mode, and review mode, but keeps its RED, validation, review, and deployment approval state separate. An unrelated repository does not inherit state, and one edit cannot span multiple worktrees.
+
+Run controller commands from the worktree they apply to. The existing `--session` value stays the same because VoltFlow resolves the worktree from the command's current directory.
+
 ### Enable multi-agent v2
 
 To use v2 with per-subagent model and reasoning controls, add this to `~/.codex/config.toml`:

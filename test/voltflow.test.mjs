@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -31,6 +31,20 @@ function fixture() {
       fingerprint = value;
     },
   };
+}
+
+function worktreeFixture() {
+  const root = mkdtempSync(path.join(tmpdir(), "voltflow-main-"));
+  const worker = mkdtempSync(path.join(tmpdir(), "voltflow-worker-"));
+  const dataDir = mkdtempSync(path.join(tmpdir(), "voltflow-state-"));
+  git(root, "init", "-q");
+  git(root, "config", "user.email", "qa@example.com");
+  git(root, "config", "user.name", "QA");
+  writeFileSync(path.join(root, "README.md"), "base\n");
+  git(root, "add", "README.md");
+  git(root, "commit", "-qm", "base");
+  git(root, "worktree", "add", "-qb", "worker", worker);
+  return { root, worker, dataDir, options: { dataDir, pluginRoot: "/plugin" } };
 }
 
 function input(event, extra = {}) {
@@ -227,6 +241,201 @@ test("active v2 spawns require isolated context", () => {
     }),
     fx.options,
   ), null);
+});
+
+test("linked worktrees inherit isolated workflow state from an active session", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  assert.equal(handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: {
+      command: `*** Begin Patch\n*** Add File: ${path.join(fx.worker, "test/app.test.mjs")}\n+test\n*** End Patch`,
+    },
+  }), fx.options), null);
+
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "exec_command",
+    tool_input: { cmd: "node --test", workdir: fx.worker },
+    tool_response: { exit_code: 1, output: "expected failure" },
+  }), fx.options);
+
+  const parent = loadState(fx.dataDir, "session-1", fx.root);
+  const worker = loadState(fx.dataDir, "session-1", fx.worker);
+  assert.equal(worker.cwd, realpathSync(fx.worker));
+  assert.equal(worker.tier, "high");
+  assert.ok(worker.red);
+  assert.equal(parent.red, null);
+});
+
+test("an unrelated repository cannot inherit worktree session state", () => {
+  const fx = worktreeFixture();
+  const unrelated = mkdtempSync(path.join(tmpdir(), "voltflow-unrelated-"));
+  git(unrelated, "init", "-q");
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "exec_command",
+    tool_input: { cmd: "node --test", workdir: unrelated },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(result.hookSpecificOutput.permissionDecisionReason, /no workflow state/i);
+});
+
+test("one edit cannot span linked worktrees even when it supplies workdir", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "exempt", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: {
+      workdir: fx.root,
+      command: `*** Begin Patch\n*** Update File: ${path.join(fx.root, "README.md")}\n+main\n*** Update File: ${path.join(fx.worker, "README.md")}\n+worker\n*** End Patch`,
+    },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(result.hookSpecificOutput.permissionDecisionReason, /span multiple Git worktrees/i);
+});
+
+test("review receipts route to their assigned worktree state", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "test/app.test.mjs") },
+  }), fx.options);
+  for (const exitCode of [1, 0]) {
+    handleHook(input("PostToolUse", {
+      cwd: fx.root,
+      tool_name: "exec_command",
+      tool_input: { cmd: "node --test", workdir: fx.worker },
+      tool_response: { exit_code: exitCode, output: exitCode === 0 ? "pass" : "expected failure" },
+    }), fx.options);
+  }
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "correctness-security"],
+    { ...fx.options, cwd: fx.worker },
+  );
+  assert.equal(assigned.exitCode, 0, assigned.stderr);
+  const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
+
+  assert.equal(handleHook(input("SubagentStop", {
+    cwd: fx.root,
+    agent_id: "worker-reviewer",
+    last_assistant_message: `VOLTFLOW_REVIEW: PASS correctness-security ${token}`,
+  }), fx.options), null);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).reviewPasses.length, 1);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).reviewPasses.length, 0);
+});
+
+test("a reused worktree inherits each new parent workflow classification", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Update documentation" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "README.md") },
+  }), fx.options);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tdd, "exempt");
+  handleHook(input("Stop", { cwd: fx.root, last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Change behavior" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "standard", "--tdd", "required", "--review", "single"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "src/app.mjs") },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(result.hookSpecificOutput.permissionDecisionReason, /failing test|reproduction/i);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tdd, "required");
+});
+
+test("a continuation does not adopt worker state from an older workflow", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Update documentation" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "README.md") },
+  }), fx.options);
+  handleHook(input("Stop", { cwd: fx.root, last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Change behavior" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "standard", "--tdd", "required", "--review", "single"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Also update the worker" }), fx.options);
+
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "src/app.mjs") },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(result.hookSpecificOutput.permissionDecisionReason, /failing test|reproduction/i);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tdd, "required");
+});
+
+test("repeated prompt text starts a new worktree workflow generation", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Apply changes" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "README.md") },
+  }), fx.options);
+  handleHook(input("Stop", { cwd: fx.root, last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Apply changes" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "standard", "--tdd", "required", "--review", "single"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const result = handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "src/app.mjs") },
+  }), fx.options);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tdd, "required");
 });
 
 test("classification and a real RED precede production edits", () => {

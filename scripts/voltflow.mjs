@@ -9,6 +9,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   statSync,
@@ -95,11 +96,14 @@ export function runController(argv, options = {}) {
     return withStateLock(dataDir, sessionId, () => runController(argv, { ...options, locked: true }));
   }
   const currentFingerprint = fingerprint(cwd);
-  const loaded = loadState(dataDir, sessionId);
-  if (loaded !== null && !sameWorkspace(loaded.cwd, cwd)) {
-    return failure(`session belongs to a different workspace: ${loaded.cwd}`);
+  const loaded = loadState(dataDir, sessionId, cwd);
+  const related = relatedState(dataDir, sessionId, cwd);
+  if (loaded === null && related === null && loadSessionStates(dataDir, sessionId).length > 0) {
+    return failure("session belongs to a different Git repository");
   }
-  const state = loaded ?? freshState(sessionId, cwd, null, currentFingerprint);
+  const state = newerWorkflow(related, loaded)
+    ? inheritedState(sessionId, cwd, related, currentFingerprint)
+    : loaded ?? inheritedState(sessionId, cwd, related, currentFingerprint);
 
   if (command === "start") {
     if (!TIERS.has(flags.tier) || !TDD_MODES.has(flags.tdd) || !REVIEW_MODES.has(flags.review)) {
@@ -235,8 +239,13 @@ export function runController(argv, options = {}) {
   return failure(USAGE);
 }
 
-export function loadState(dataDir, sessionId) {
-  const file = statePath(dataDir, sessionId);
+export function loadState(dataDir, sessionId, cwd) {
+  const primary = loadStateFile(statePath(dataDir, sessionId), sessionId);
+  if (cwd === undefined || primary !== null && sameWorkspace(primary.cwd, cwd)) return primary;
+  return loadStateFile(worktreeStatePath(dataDir, sessionId, cwd), sessionId);
+}
+
+function loadStateFile(file, sessionId) {
   if (!existsSync(file)) return null;
   try {
     const value = JSON.parse(readFileSync(file, "utf8"));
@@ -305,8 +314,7 @@ function onUserPrompt(input, context) {
 
 function onUserPromptLocked(input, context) {
   if (typeof input.prompt !== "string" || typeof input.session_id !== "string") return null;
-  const loaded = loadState(context.dataDir, input.session_id);
-  const previous = loaded !== null && sameWorkspace(loaded.cwd, input.cwd) ? loaded : null;
+  const previous = loadState(context.dataDir, input.session_id, input.cwd);
   const overrideReason = deploymentOverrideReason(input.prompt);
   const current = context.fingerprint(input.cwd);
 
@@ -324,9 +332,13 @@ function onUserPromptLocked(input, context) {
   }
 
   const unfinished = previous?.changed === true && previous.approval?.fingerprint !== current;
-  const state = previous?.active === true || unfinished
+  const continuing = previous?.active === true || unfinished;
+  const state = continuing
     ? previous
     : freshState(input.session_id, input.cwd, previous, current);
+  const previousPromptHash = state.promptHash;
+  const previousWorkflowId = state.workflowId;
+  if (continuing && typeof state.workflowId !== "string") state.workflowId = randomUUID();
   state.active = true;
   state.promptHash = createHash("sha256").update(input.prompt).digest("hex");
   state.stopBlocks = 0;
@@ -334,6 +346,17 @@ function onUserPromptLocked(input, context) {
   state.valueWarningIssued = false;
   state.updatedAt = timestamp();
   saveState(context.dataDir, state);
+  if (continuing) {
+    for (const related of relatedStates(context.dataDir, input.session_id, input.cwd)) {
+      const sameWorkflow = typeof previousWorkflowId === "string"
+        ? related.workflowId === previousWorkflowId
+        : related.workflowId === undefined && related.promptHash === previousPromptHash;
+      if (!sameWorkflow) continue;
+      related.workflowId = state.workflowId;
+      related.promptHash = state.promptHash;
+      saveState(context.dataDir, related);
+    }
+  }
 
   const script = path.join(context.pluginRoot, "scripts", "voltflow.mjs");
   const prefix = `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(input.session_id)}`;
@@ -357,12 +380,23 @@ function deploymentOverrideReason(prompt) {
 
 function onPreToolUse(input, context) {
   if (typeof input.session_id !== "string" || typeof input.cwd !== "string" || typeof input.tool_name !== "string") return null;
-  const state = loadState(context.dataDir, input.session_id);
-  if (state !== null && !sameWorkspace(state.cwd, input.cwd)) {
-    return deny("VoltFlow blocked the tool: this session belongs to a different workspace.");
+  const workspace = hookWorkspace(input);
+  if (workspace.error !== null) return deny(`VoltFlow blocked the tool: ${workspace.error}`);
+  const state = withStateLock(context.dataDir, input.session_id, () => {
+    const existing = loadState(context.dataDir, input.session_id, workspace.cwd);
+    const related = relatedState(context.dataDir, input.session_id, workspace.cwd);
+    if (existing !== null && !newerWorkflow(related, existing)) return existing;
+    if (related === null) return null;
+    const inherited = inheritedState(input.session_id, workspace.cwd, related, context.fingerprint(workspace.cwd));
+    saveState(context.dataDir, inherited);
+    return inherited;
+  });
+  if (state === null && loadSessionStates(context.dataDir, input.session_id).length > 0) {
+    return deny("VoltFlow blocked the tool: this session has no workflow state for that Git repository.");
   }
-  if (context.configError !== null && isCommandTool(input.tool_name)) {
-    return deny(`VoltFlow configuration must be fixed before command execution: ${context.configError}`);
+  const configError = loadProjectConfig(workspace.cwd).error;
+  if (configError !== null && isCommandTool(input.tool_name)) {
+    return deny(`VoltFlow configuration must be fixed before command execution: ${configError}`);
   }
   if (
     state?.active === true
@@ -374,18 +408,18 @@ function onPreToolUse(input, context) {
     return deny('VoltFlow requires v2 subagents to use fork_turns: "none".');
   }
 
-  if (isDeployInvocation(input.tool_name, input.tool_input, input.cwd)) {
+  if (isDeployInvocation(input.tool_name, input.tool_input, workspace.cwd)) {
     if (state === null) return deny("VoltFlow blocked deployment: no workflow state or review receipt exists.");
-    const current = context.fingerprint(input.cwd);
+    const current = context.fingerprint(workspace.cwd);
     const gate = gateStatus(state, current);
     if (!gate.allowed) return deny(`VoltFlow blocked deployment: ${gate.reason}`);
     if (gate.source === "user override") {
       return withStateLock(context.dataDir, input.session_id, () => {
-        const fresh = loadState(context.dataDir, input.session_id);
-        if (fresh === null || !sameWorkspace(fresh.cwd, input.cwd)) {
+        const fresh = loadState(context.dataDir, input.session_id, workspace.cwd);
+        if (fresh === null) {
           return deny("VoltFlow blocked deployment: workflow state changed before the override could be consumed.");
         }
-        const freshGate = gateStatus(fresh, context.fingerprint(input.cwd));
+        const freshGate = gateStatus(fresh, context.fingerprint(workspace.cwd));
         if (freshGate.source !== "user override") {
           return deny(`VoltFlow blocked deployment: ${freshGate.reason ?? "the one-shot override was already consumed"}.`);
         }
@@ -419,10 +453,12 @@ function onPostToolUse(input, context) {
 
 function onPostToolUseLocked(input, context) {
   if (typeof input.session_id !== "string" || typeof input.cwd !== "string") return null;
-  const state = loadState(context.dataDir, input.session_id);
-  if (state?.active !== true || !sameWorkspace(state.cwd, input.cwd)) return null;
+  const workspace = hookWorkspace(input);
+  if (workspace.error !== null) return null;
+  const state = loadState(context.dataDir, input.session_id, workspace.cwd);
+  if (state?.active !== true) return null;
   const failed = toolFailed(input.tool_response);
-  const current = context.fingerprint(input.cwd);
+  const current = context.fingerprint(workspace.cwd);
   const recoveredViolation = recoverRevertedViolation(state, current);
 
   const editTool = typeof input.tool_name === "string" && isEditTool(input.tool_name);
@@ -493,15 +529,16 @@ function onSubagentStop(input, context) {
 
 function onSubagentStopLocked(input, context) {
   if (typeof input.session_id !== "string" || typeof input.last_assistant_message !== "string") return null;
-  const state = loadState(context.dataDir, input.session_id);
-  if (state === null || !sameWorkspace(state.cwd, input.cwd)) return null;
   const result = /(?:^|\n)VOLTFLOW_REVIEW:\s*(PASS|FAIL)\s+([a-z0-9][a-z0-9_-]*)\s+([a-f0-9-]+)\s*$/i.exec(
     input.last_assistant_message.trimEnd(),
   );
-  if (result === null || !["single", "split"].includes(state.reviewMode)) return null;
-
+  if (result === null) return null;
   const [, outcome, lane, token] = result;
-  const current = context.fingerprint(input.cwd);
+  const state = loadSessionStates(context.dataDir, input.session_id).find((candidate) =>
+    candidate.reviewAssignments.some((entry) => entry.lane === lane && entry.token === token));
+  if (state === undefined) return { systemMessage: "VoltFlow ignored an unassigned or stale review receipt." };
+  if (!["single", "split"].includes(state.reviewMode)) return null;
+  const current = context.fingerprint(state.cwd);
   const assignment = state.reviewAssignments.find(
     (entry) => entry.lane === lane && entry.token === token && entry.fingerprint === current,
   );
@@ -547,7 +584,7 @@ function onStop(input, context) {
 
 function onStopLocked(input, context) {
   if (typeof input.session_id !== "string") return null;
-  const state = loadState(context.dataDir, input.session_id);
+  const state = loadState(context.dataDir, input.session_id, input.cwd);
   if (state?.active !== true) return null;
   if (!state.changed) {
     state.active = false;
@@ -584,6 +621,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     version: 1,
     sessionId,
     cwd: canonicalWorkspacePath(cwd),
+    workflowId: randomUUID(),
     active: true,
     tier: "unclassified",
     tdd: "unclassified",
@@ -610,6 +648,20 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     createdAt: timestamp(),
     updatedAt: timestamp(),
   };
+}
+
+function inheritedState(sessionId, cwd, source, currentFingerprint) {
+  const state = freshState(sessionId, cwd, null, currentFingerprint);
+  if (source === null) return state;
+  Object.assign(state, {
+    active: source.active,
+    tier: source.tier,
+    tdd: source.tdd,
+    reviewMode: source.reviewMode,
+    workflowId: source.workflowId ?? source.promptHash ?? state.workflowId,
+    promptHash: source.promptHash,
+  });
+  return state;
 }
 
 function gateStatus(state, currentFingerprint) {
@@ -639,7 +691,11 @@ function evidenceBlocker(state, currentFingerprint) {
 }
 
 function saveState(dataDir, state) {
-  const file = statePath(dataDir, state.sessionId);
+  const primaryPath = statePath(dataDir, state.sessionId);
+  const primary = loadStateFile(primaryPath, state.sessionId);
+  const file = primary === null || sameWorkspace(primary.cwd, state.cwd)
+    ? primaryPath
+    : worktreeStatePath(dataDir, state.sessionId, state.cwd);
   mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
@@ -683,6 +739,7 @@ function validState(value, sessionId) {
     && value.version === 1
     && value.sessionId === sessionId
     && typeof value.cwd === "string"
+    && (value.workflowId === undefined || typeof value.workflowId === "string")
     && typeof value.active === "boolean"
     && typeof value.changed === "boolean"
     && typeof value.tddViolation === "boolean"
@@ -750,6 +807,49 @@ function statePath(dataDir, sessionId) {
   return path.join(dataDir, "sessions", `${key}.json`);
 }
 
+function worktreeStatePath(dataDir, sessionId, cwd) {
+  const sessionKey = createHash("sha256").update(sessionId).digest("hex");
+  const workspaceKey = createHash("sha256").update(canonicalWorkspacePath(cwd)).digest("hex");
+  return path.join(dataDir, "sessions", sessionKey, `${workspaceKey}.json`);
+}
+
+function loadSessionStates(dataDir, sessionId) {
+  const states = [];
+  const primary = loadStateFile(statePath(dataDir, sessionId), sessionId);
+  if (primary !== null) states.push(primary);
+  const directory = path.join(dataDir, "sessions", createHash("sha256").update(sessionId).digest("hex"));
+  if (!existsSync(directory)) return states;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const state = loadStateFile(path.join(directory, entry.name), sessionId);
+    if (state !== null) states.push(state);
+  }
+  return states;
+}
+
+function relatedState(dataDir, sessionId, cwd) {
+  const primary = loadState(dataDir, sessionId);
+  if (primary !== null) {
+    if (sameWorkspace(primary.cwd, cwd)) return null;
+    if (sameRepository(primary.cwd, cwd)) return primary;
+  }
+  return relatedStates(dataDir, sessionId, cwd)[0] ?? null;
+}
+
+function relatedStates(dataDir, sessionId, cwd) {
+  return loadSessionStates(dataDir, sessionId)
+    .filter((state) => !sameWorkspace(state.cwd, cwd) && sameRepository(state.cwd, cwd));
+}
+
+function newerWorkflow(source, target) {
+  const sourceId = source?.workflowId ?? source?.promptHash;
+  const targetId = target?.workflowId ?? target?.promptHash;
+  return source !== null
+    && target !== null
+    && typeof sourceId === "string"
+    && sourceId !== targetId;
+}
+
 function editedPaths(toolInput) {
   const direct = isRecord(toolInput)
     ? [toolInput.path, toolInput.file_path, toolInput.filePath].filter((value) => typeof value === "string")
@@ -762,6 +862,21 @@ function editedPaths(toolInput) {
   if (patch === null) return direct;
   const paths = [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)].map((match) => match[1].trim());
   return [...new Set([...direct, ...paths])];
+}
+
+function hookWorkspace(input) {
+  const base = input.cwd;
+  if (!isEditTool(input.tool_name) && isRecord(input.tool_input) && typeof input.tool_input.workdir === "string") {
+    return { cwd: path.resolve(base, input.tool_input.workdir), error: null };
+  }
+  if (!isEditTool(input.tool_name)) return { cwd: base, error: null };
+  const baseRoot = gitWorktreeRoot(base);
+  if (baseRoot === null) return { cwd: base, error: null };
+  const roots = new Set(editedPaths(input.tool_input)
+    .map((file) => gitWorktreeRoot(path.resolve(base, file)))
+    .filter((root) => root !== null));
+  if (roots.size > 1) return { cwd: base, error: "one edit cannot span multiple Git worktrees" };
+  return { cwd: roots.values().next().value ?? baseRoot, error: null };
 }
 
 function isTestPath(file) {
@@ -988,6 +1103,35 @@ function sameWorkspace(left, right) {
 }
 
 function canonicalWorkspacePath(value) {
+  return gitWorktreeRoot(value) ?? canonicalPath(value);
+}
+
+function sameRepository(left, right) {
+  const leftCommon = gitCommonDirectory(left);
+  const rightCommon = gitCommonDirectory(right);
+  return leftCommon !== null && leftCommon === rightCommon;
+}
+
+function gitWorktreeRoot(value) {
+  const directory = nearestExistingDirectory(value);
+  const result = git(directory, ["rev-parse", "--show-toplevel"]);
+  return result.ok ? canonicalPath(result.stdout.trim()) : null;
+}
+
+function gitCommonDirectory(value) {
+  const directory = nearestExistingDirectory(value);
+  const result = git(directory, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return result.ok ? canonicalPath(result.stdout.trim()) : null;
+}
+
+function nearestExistingDirectory(value) {
+  let current = path.resolve(value);
+  while (!existsSync(current) && path.dirname(current) !== current) current = path.dirname(current);
+  if (existsSync(current) && !lstatSync(current).isDirectory()) return path.dirname(current);
+  return current;
+}
+
+function canonicalPath(value) {
   const resolved = path.resolve(value);
   try {
     return realpathSync.native(resolved);
