@@ -339,12 +339,12 @@ test("registered subagent events route to the assigned worktree without a tool w
     cwd: fx.root,
     agent_id: "worker-1",
     tool_name: "Bash",
-    tool_input: { command: "python3 -m unittest tests.test_report -v" },
+    tool_input: { command: "python3 -B -m unittest tests.test_report -v" },
     tool_response: { exit_code: 1, output: "FAILED (errors=1)" },
   }), fx.options);
 
   assert.equal(loadState(fx.dataDir, "session-1", fx.root).red, null);
-  assert.match(loadState(fx.dataDir, "session-1", fx.worker).red.details, /python3 -m unittest/);
+  assert.match(loadState(fx.dataDir, "session-1", fx.worker).red.details, /python3 -B -m unittest/);
 });
 
 test("an explicit command workdir overrides a registered subagent worktree", () => {
