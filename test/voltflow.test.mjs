@@ -279,6 +279,22 @@ test("linked worktrees inherit isolated workflow state from an active session", 
   assert.equal(parent.red, null);
 });
 
+test("status persists an inherited worktree baseline", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const status = runController(
+    ["status", "--session", "session-1"],
+    { ...fx.options, cwd: fx.worker },
+  );
+  assert.equal(status.exitCode, 0, status.stderr);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).cwd, realpathSync(fx.worker));
+});
+
 test("an unrelated repository cannot inherit worktree session state", () => {
   const fx = worktreeFixture();
   const unrelated = mkdtempSync(path.join(tmpdir(), "voltflow-unrelated-"));
@@ -960,6 +976,32 @@ test("transparent wrappers and dotted unittest selectors record RED without pois
   assert.match(state.red.details, /python3 -m unittest/);
 });
 
+test("desktop exec hooks route nested test RED to the command worktree", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const command = "rtk python3 -m unittest tests.test_graph.StageTests.test_cycle";
+  const hook = {
+    cwd: fx.root,
+    tool_name: "exec",
+    tool_input: `const r = await tools.exec_command(${JSON.stringify({ cmd: command, workdir: fx.worker })});\ntext(r.output);`,
+  };
+  assert.equal(handleHook(input("PreToolUse", hook), fx.options), null);
+  handleHook(input("PostToolUse", {
+    ...hook,
+    tool_response: [
+      { type: "input_text", text: "Script completed\nOutput:\n" },
+      { type: "input_text", text: "Ran 1 test in 0.001s\nFAILED (failures=1)\n" },
+    ],
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).red, null);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).red.details, command);
+});
+
 test("a wrapper cannot create RED without test-runner output", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Implement graph validation" }), fx.options);
@@ -1139,6 +1181,16 @@ test("compound and flagged deployment commands remain gated", () => {
 
   writeFileSync(path.join(fx.root, ".voltflow.json"), JSON.stringify({ deployPatterns: ["^make promote$"] }));
   assert.equal(isDeployInvocation("Bash", { command: "echo ready && make promote" }, fx.root), true);
+});
+
+test("desktop exec hooks inspect every nested command for deployment", () => {
+  const source = [
+    `const inspect = await tools.exec_command(${JSON.stringify({ cmd: "node --version" })});`,
+    `const deploy = await tools.exec_command(${JSON.stringify({ cmd: "npm run deploy" })});`,
+    "text(inspect.output); text(deploy.output);",
+  ].join("\n");
+
+  assert.equal(isDeployInvocation("exec", source, "/repo"), true);
 });
 
 test("piped test commands cannot create validation evidence", () => {

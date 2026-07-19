@@ -22,7 +22,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const TIERS = new Set(["trivial", "standard", "high"]);
 const TDD_MODES = new Set(["required", "exempt"]);
 const REVIEW_MODES = new Set(["self", "single", "split"]);
-const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "review", "approve"]);
+const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "review", "approve", "status"]);
 const SPLIT_LANES = new Set(["correctness-security", "validation-scope"]);
 const REVIEW_RANK = { self: 0, single: 1, split: 2 };
 const TIER_RANK = { trivial: 0, standard: 1, high: 2 };
@@ -229,6 +229,7 @@ export function runController(argv, options = {}) {
   }
 
   if (command === "status") {
+    if (state !== loaded) saveState(dataDir, state);
     return success(JSON.stringify(state, null, 2));
   }
 
@@ -460,7 +461,6 @@ function onPostToolUseLocked(input, context) {
   if (workspace.unmanaged === true) return null;
   const state = loadState(context.dataDir, input.session_id, workspace.cwd);
   if (state?.active !== true) return null;
-  const failed = toolFailed(input.tool_response);
   const current = context.fingerprint(workspace.cwd);
   const recoveredViolation = recoverRevertedViolation(state, current);
 
@@ -469,6 +469,7 @@ function onPostToolUseLocked(input, context) {
     ? commandFrom(input.tool_input)
     : null;
   const testCommand = command !== null && isTestCommand(command, input.tool_response);
+  const failed = toolFailed(input.tool_response) || testCommand && testOutputFailed(input.tool_response);
   const fingerprintChanged = current !== null && state.lastFingerprint !== null && current !== state.lastFingerprint;
   let valueWarning = null;
   if ((!failed && editTool) || fingerprintChanged) {
@@ -873,8 +874,15 @@ function editedPaths(toolInput) {
 
 function hookWorkspace(input) {
   const base = input.cwd;
-  if (!isEditTool(input.tool_name) && isRecord(input.tool_input) && typeof input.tool_input.workdir === "string") {
-    return { cwd: path.resolve(base, input.tool_input.workdir), error: null, unmanaged: false };
+  const workdirs = new Set(workdirsFrom(input.tool_input).map((workdir) => {
+    const resolved = path.resolve(base, workdir);
+    return gitWorktreeRoot(resolved) ?? canonicalPath(resolved);
+  }));
+  if (!isEditTool(input.tool_name) && workdirs.size > 1) {
+    return { cwd: base, error: "one command tool cannot span multiple worktrees", unmanaged: false };
+  }
+  if (!isEditTool(input.tool_name) && workdirs.size === 1) {
+    return { cwd: workdirs.values().next().value, error: null, unmanaged: false };
   }
   if (!isEditTool(input.tool_name)) return { cwd: base, error: null, unmanaged: false };
   const baseRoot = gitWorktreeRoot(base);
@@ -910,8 +918,16 @@ function isTestCommand(command, response) {
 
 function toolResponseText(response) {
   if (typeof response === "string") return response;
+  if (Array.isArray(response)) return response.map(toolResponseText).join("\n");
   if (!isRecord(response)) return "";
-  return [response.output, response.stdout, response.stderr].filter((value) => typeof value === "string").join("\n");
+  return [response.text, response.output, response.stdout, response.stderr, response.content]
+    .map(toolResponseText)
+    .filter(Boolean)
+    .join("\n");
+}
+
+function testOutputFailed(response) {
+  return /(?:^|\n)(?:not ok \d+\s+-|FAILED \([^\n)]*failures=[1-9]\d*|=+ .* [1-9]\d* failed|test result: FAILED|Tests:\s+.*[1-9]\d* failed|Tests run:.*Failures:\s*[1-9]\d*)/im.test(toolResponseText(response));
 }
 
 function shellSegments(command) {
@@ -950,12 +966,44 @@ function isCommandTool(toolName) {
 }
 
 function commandFrom(toolInput) {
-  if (typeof toolInput === "string") return toolInput;
+  if (typeof toolInput === "string") {
+    const nested = nestedExecInputs(toolInput);
+    return nested.length === 0 ? toolInput : nested.map((input) => input.cmd).join("\n");
+  }
   if (!isRecord(toolInput)) return null;
   for (const key of ["command", "cmd"]) {
     if (typeof toolInput[key] === "string") return toolInput[key];
   }
   return null;
+}
+
+function workdirsFrom(toolInput) {
+  if (isRecord(toolInput) && typeof toolInput.workdir === "string") return [toolInput.workdir];
+  return typeof toolInput === "string"
+    ? nestedExecInputs(toolInput).map((input) => input.workdir ?? ".")
+    : [];
+}
+
+function nestedExecInputs(source) {
+  const marker = "tools.exec_command(";
+  const starts = [];
+  for (let start = source.indexOf(marker); start !== -1; start = source.indexOf(marker, start + marker.length)) {
+    starts.push(start);
+  }
+  const property = (name, call) => {
+    const match = new RegExp(`(?:^|[,{])\\s*(?:"${name}"|${name})\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`).exec(call);
+    if (match === null) return null;
+    try {
+      return JSON.parse(match[1]);
+    } catch {
+      return null;
+    }
+  };
+  return starts.flatMap((start, index) => {
+    const call = source.slice(start, starts[index + 1] ?? source.length);
+    const cmd = property("cmd", call);
+    return cmd === null ? [] : [{ cmd, workdir: property("workdir", call) }];
+  });
 }
 
 function toolFailed(response) {
