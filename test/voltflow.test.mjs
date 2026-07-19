@@ -295,6 +295,28 @@ test("status persists an inherited worktree baseline", () => {
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).cwd, realpathSync(fx.worker));
 });
 
+test("restarting a parent workflow reactivates an already-bound worker", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  handleHook(input("Stop", { cwd: fx.root, last_assistant_message: "Interrupted" }), fx.options);
+  assert.equal(runController(
+    ["status", "--session", "session-1", "--agent", "worker-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).active, false);
+
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).active, true);
+});
+
 test("registered subagent events route to the assigned worktree without a tool workdir", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
