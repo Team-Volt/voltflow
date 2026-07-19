@@ -1,6 +1,6 @@
 ---
 name: voltflow
-description: Run a lean, risk-scaled software workflow that enforces behavioral TDD, surgical edits, bounded subagent delegation, adversarial review, and a diff-bound deployment gate. Use for implementing, fixing, refactoring, reviewing, validating, or deploying code when Codex should choose proportional planning, GPT-5.6 model/reasoning profiles, and parallel slices without unnecessary ceremony.
+description: Run a lean, risk-scaled software workflow that enforces behavioral TDD, surgical edits, bounded subagent delegation, adversarial review, and a diff-bound deployment gate. Use for implementing, fixing, refactoring, reviewing, validating, or deploying code when Codex should choose proportional planning, task-specific model and reasoning settings, and parallel slices without unnecessary ceremony.
 ---
 
 # VoltFlow
@@ -71,7 +71,7 @@ Before spawning a reviewer, state the supported product boundary and material co
 
 When failures share one mechanism, fix and test that mechanism once. Do not keep adding syntax-specific patterns after the boundary is characterized. If complete enforcement would require a shell parser, a general solver, or control over an interception surface the host does not provide, keep the local guard conservative, document the limit, and route authoritative enforcement to the controller or project configuration.
 
-After a failed review, group findings by root cause and rerun only affected coverage. If a rerun finds another variant of the same bounded limitation, stop patching variants and reassess the abstraction or accepted boundary. Finish when the original acceptance criteria have current evidence and no material ordinary-use blocker remains. Use Terra high for routine independent review. Use Sol only when the review names an authorization, private-data, payment, booking, destructive-migration, data-integrity, or cross-cutting-architecture risk that changes the completion bar, or when the user explicitly requests Sol.
+After a failed review, group findings by root cause and rerun only affected coverage. If a rerun finds another variant of the same bounded limitation, stop patching variants and reassess the abstraction or accepted boundary. Finish when the original acceptance criteria have current evidence and no material ordinary-use blocker remains. Select each reviewer's model and reasoning effort from the current task and live capabilities under [references/routing.md](references/routing.md). Prefer a configuration different from the author when available, and raise capability or effort only when the review scope, uncertainty, or a named high-risk boundary changes the completion bar.
 
 ## Gate deployment
 

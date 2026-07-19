@@ -31,28 +31,20 @@ The user can overrule the gate in ordinary language by clearly directing VoltFlo
 
 ## Model routing
 
-The bootstrap router uses five profiles:
+The main session selects a model and reasoning effort for each concrete assignment from the capabilities exposed by the current Codex installation. It chooses by difficulty, ambiguity, risk, and verifiability rather than pinning a model family to a role.
 
-| Work | Model and effort |
-| --- | --- |
-| Discovery, tests, mechanical edits | Luna high |
-| Standard implementation | Terra max |
-| Planning and integration | Sol medium |
-| Routine adversarial or correctness review | Terra high |
-| Security, architecture, migrations, difficult ambiguity | Sol max |
+Mechanical work tends toward the fastest capable model at low or medium effort. Bounded implementation tends toward a balanced coding model at medium or high effort. Ambiguous integration, holistic review, and named high-risk boundaries justify stronger models or more reasoning. Independent reviewers should use a different model or reasoning configuration from the author when one is available.
 
-Direct `model` and `reasoning_effort` overrides are used when the active spawn schema supports them. Otherwise VoltFlow selects a matching agent profile when possible; if neither route exists, it inherits the parent and reports `routing degraded` instead of pretending the requested profile ran.
+Direct `model` and `reasoning_effort` overrides are used when the active spawn schema supports them. Otherwise VoltFlow selects the closest matching agent profile when possible; if neither route exists, it inherits the parent and reports `routing degraded`. Explicit user selections are never silently substituted or downgraded.
 
-Routine review-only agents are cost-controlled: they must explicitly use Terra high. Sol is reserved for a named authorization, private-data, payment, booking, destructive/data-integrity migration, or cross-cutting-architecture risk, or a direct user request.
-
-This table starts from the community [Codex quota frontier analysis](https://www.reddit.com/r/codex/comments/1ut3bnp/the_codex_pareto_frontier_luna_high_terra_max_sol/), checked against the different [Artificial Analysis API-cost frontier](https://artificialanalysis.ai/articles/gpt-5-6-intelligence-vs-cost-across-sol-terra-luna). It is a prior, not a permanent benchmark result. OpenAI's [GPT-5.6 prompt guidance](https://developers.openai.com/api/docs/guides/prompt-guidance-gpt-5p6) supplies the prompt shape: one outcome, explicit constraints, evidence, and a stopping condition, with each rule stated once.
+The complete selection rubric is in [routing.md](skills/voltflow/references/routing.md). The chosen model, effort, and task-based rationale are recorded with the assignment or result so routing decisions remain reviewable.
 
 ## Multi-agent compatibility
 
 VoltFlow does not call a subagent API from its Node runtime. The main Codex agent uses whichever host schema is available:
 
 - Multi-agent v1 uses the namespaced `multi_agent_v1.spawn_agent` fields, including direct `model` and `reasoning_effort` overrides.
-- Multi-agent v2 uses the flat `spawn_agent` shape with `task_name`, `message`, and `fork_turns: "none"`. VoltFlow never uses full-history inheritance for a v2 spawn. It passes model settings only when that schema exposes them; otherwise it uses a pinned agent profile or reports degraded routing.
+- Multi-agent v2 uses the flat `spawn_agent` shape with `task_name`, `message`, and `fork_turns: "none"`. VoltFlow never uses full-history inheritance for a v2 spawn. It passes model settings only when that schema exposes them; otherwise it uses the closest configured profile or reports degraded routing.
 
 The lifecycle hooks consume `SubagentStart` and `SubagentStop`, so review receipts are independent of the spawn API version. Both host schemas are supported; the active schema still determines whether direct model and reasoning overrides are available.
 

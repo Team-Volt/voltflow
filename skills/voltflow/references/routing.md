@@ -1,22 +1,27 @@
-# GPT-5.6 routing
+# Model and reasoning routing
 
-Use the smallest profile that clears the task. These profiles seed VoltFlow's routing table; rerun the eval suite when model behavior or quota accounting changes.
+Choose the model and reasoning effort for the concrete assignment from the capabilities available in the current Codex installation. This is a selection rubric, not a fixed profile table; rerun the eval suite when model behavior, availability, or quota accounting changes.
 
-| Profile | Route work here |
-| --- | --- |
-| `gpt-5.6-luna`, `high` | Read-heavy discovery, focused test execution, mechanical edits, and simple pattern-following work. |
-| `gpt-5.6-terra`, `max` | Standard implementation inside established architecture and bounded multi-file changes. |
-| `gpt-5.6-terra`, `high` | Routine independent review, adversarial correctness checks, and bounded security review without a named high-risk boundary. |
-| `gpt-5.6-sol`, `medium` | Planning and integration that need global coherence without max-cost reasoning. |
-| `gpt-5.6-sol`, `max` | High-risk architecture, security, concurrency, migrations, and ambiguous work where a missed constraint is expensive. |
+Inspect the active spawn schema before delegating. Treat its model descriptions and supported reasoning efforts as authoritative, and do not infer capability from a model name alone.
+
+| Task characteristics | Model tendency | Reasoning tendency |
+| --- | --- | --- |
+| Mechanical, read-heavy, repetitive, or easy to verify | Fastest capable model | Low or medium |
+| Bounded implementation with clear acceptance checks | Balanced coding model | Medium or high |
+| Ambiguous planning, difficult debugging, or cross-cutting integration | Strongest suitable model | High or above |
+| Adversarial or holistic review | Capable reviewer, preferably configured differently from the author | Scale with ambiguity and the strength of deterministic checks |
+| Named high-risk boundary where a miss is expensive | Strongest suitable model | High or above |
 
 ## Routing rules
 
-1. Choose by difficulty, not by role title. A mechanical security-file edit can use Luna; a subtle one-file race can require Sol max.
-2. Set `model` and `reasoning_effort` directly when the spawn schema exposes them. Omit `service_tier`.
-3. If only `agent_type` is available, select a profile that pins the required model and effort. If neither override surface exists, inherit the parent and state `routing degraded` once in the result.
-4. Use Terra high for routine review-only agents. The controller requires it explicitly, so do not inherit the parent model. Use Sol only with a named high-risk exception (authorization, private data, payments, bookings, destructive/data-integrity migrations, or cross-cutting architecture) or when the user explicitly requests it.
-5. Size each wave to the useful independent slices and the host's available concurrency. Do not create slices solely to increase agent count.
+1. Choose by task difficulty, ambiguity, risk, and verifiability rather than role title. A mechanical security-file edit can use a fast model at medium effort; a subtle one-file race can need the strongest model at high effort.
+2. The main session owns the selection. Set `model` and `reasoning_effort` directly when the spawn schema exposes them, and omit `service_tier` unless the user requests one.
+3. For independent review, prefer a model or reasoning configuration different from the author when available. Raise capability or effort only when the review scope, uncertainty, or named risk justifies it.
+4. Named high-risk boundaries include authorization, private data, payments, bookings, destructive or data-integrity migrations, and cross-cutting architecture. They establish a higher selection floor without prescribing one model family.
+5. Honor an explicit user selection. If the requested model or effort is unavailable, report that instead of silently substituting or downgrading it.
+6. If only `agent_type` is available, select the closest matching configured profile. If no override surface exists, inherit the parent and state `routing degraded` once in the result.
+7. Record the selected model, reasoning effort, and short task-based rationale in the assignment or result so routing decisions remain reviewable.
+8. Size each wave to the useful independent slices and the host's available concurrency. Do not create slices solely to increase agent count.
 
 ## Spawn schema
 
