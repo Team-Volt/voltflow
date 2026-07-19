@@ -318,6 +318,51 @@ test("restarting a parent workflow reactivates an already-bound worker", () => {
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).active, true);
 });
 
+test("upgrading a parent workflow invalidates weaker worker approval", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "standard", "--tdd", "exempt", "--review", "single"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["status", "--session", "session-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "worker checks passed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: fx.worker },
+  );
+  const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
+  assert.ok(token);
+  handleHook(input("SubagentStop", {
+    agent_id: "worker-reviewer",
+    last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${token}`,
+  }), fx.options);
+  assert.equal(runController(
+    ["gate", "--session", "session-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "exempt", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const worker = loadState(fx.dataDir, "session-1", fx.worker);
+  assert.equal(worker.reviewMode, "split");
+  assert.equal(worker.approval, null);
+  assert.deepEqual(worker.reviewPasses, []);
+  assert.equal(runController(
+    ["gate", "--session", "session-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 1);
+});
+
 test("registered subagent events route to the assigned worktree without a tool workdir", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);

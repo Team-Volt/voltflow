@@ -126,10 +126,7 @@ export function runController(argv, options = {}) {
         return failure(`cannot change an active workflow from tdd=${state.tdd} to tdd=${flags.tdd}`);
       }
       if (flags.tier !== state.tier || flags.review !== state.reviewMode) {
-        state.reviewAssignments = [];
-        state.reviewPasses = [];
-        state.reviewFailure = null;
-        state.approval = null;
+        invalidateReview(state);
       }
       state.tier = flags.tier;
       state.reviewMode = flags.review;
@@ -745,6 +742,9 @@ function saveStartedState(dataDir, state) {
   const workflowId = state.workflowId ?? state.promptHash;
   for (const related of relatedStates(dataDir, state.sessionId, state.cwd)) {
     if ((related.workflowId ?? related.promptHash) !== workflowId) continue;
+    if (related.tier !== state.tier || related.reviewMode !== state.reviewMode) {
+      invalidateReview(related);
+    }
     Object.assign(related, {
       active: true,
       tier: state.tier,
@@ -1300,12 +1300,16 @@ function recoverRevertedViolation(state, currentFingerprint) {
 function invalidateForChange(state) {
   state.changed = true;
   state.validation = null;
+  invalidateReview(state);
+  state.override = null;
+  state.stopBlocks = 0;
+}
+
+function invalidateReview(state) {
   state.reviewAssignments = [];
   state.reviewPasses = [];
   state.reviewFailure = null;
   state.approval = null;
-  state.override = null;
-  state.stopBlocks = 0;
 }
 
 function success(stdout) {
