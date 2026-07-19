@@ -809,6 +809,23 @@ test("successful test output may report zero failed tests", () => {
   assert.match(loadState(fx.dataDir, "session-1").validation.details, /cargo test/);
 });
 
+test("passing unittest output cannot derive an exit code from a test name", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Update the report" }), fx.options);
+  start(fx);
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "python3 -m unittest discover -s tests -v" },
+    tool_response:
+      "test_runs_a_task_and_records_its_exit_code_and_output (tests.test_report.ReportTests) ... ok\n" +
+      "Ran 18 tests in 0.050s\n\nOK",
+  }), fx.options);
+
+  const state = loadState(fx.dataDir, "session-1");
+  assert.equal(state.red, null);
+  assert.match(state.validation.details, /python3 -m unittest/);
+});
+
 test("an unfinished workflow reactivates when the user says continue", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);
