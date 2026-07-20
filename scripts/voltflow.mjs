@@ -495,18 +495,20 @@ function onPostToolUseLocked(input, context) {
   const testCommand = command !== null && isTestCommand(command, input.tool_response);
   const failed = toolFailed(input.tool_response) || testCommand && testOutputFailed(input.tool_response);
   const fingerprintChanged = current !== null && state.lastFingerprint !== null && current !== state.lastFingerprint;
+  const gitMetadataCommand = command !== null && isGitMetadataCommand(command);
   let valueWarning = null;
   if ((!failed && editTool) || fingerprintChanged) {
     const paths = editedPaths(input.tool_input);
     const testOnlyEdit = editTool && paths.length > 0 && paths.every(isTestPath);
     const touchesTest = testCommand || (editTool && paths.some(isTestPath)) || (command !== null && commandMentionsTestPath(command));
-    const touchesProduction = !testCommand && (
+    const touchesProduction = !testCommand && !gitMetadataCommand && (
       (editTool && paths.some((file) => !isTestPath(file)))
       || (command !== null && commandMentionsProductionPath(command))
     );
     if (
       state.validation?.fingerprint === state.lastFingerprint
       && !testOnlyEdit
+      && !gitMetadataCommand
       && (touchesProduction || (fingerprintChanged && command !== null))
     ) {
       state.reworkCycles = (state.reworkCycles ?? 0) + 1;
@@ -515,7 +517,7 @@ function onPostToolUseLocked(input, context) {
         valueWarning = { systemMessage: VALUE_WARNING };
       }
     }
-    if (state.tdd === "required" && state.red === null && state.tddViolation !== true && !testOnlyEdit && !testCommand && !recoveredViolation) {
+    if (state.tdd === "required" && state.red === null && state.tddViolation !== true && !testOnlyEdit && !testCommand && !gitMetadataCommand && !recoveredViolation) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
     }
@@ -551,7 +553,7 @@ function onSubagentStart(input, context) {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        `VoltFlow subtask contract: ${prefix === null ? "" : `run ${prefix} from the assigned worktree; use external permission if protected plugin state is sandboxed. `}In your first user-visible update, state the selected model, reasoning effort, and a one-sentence reason for that route from the assignment's EVIDENCE field. Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
+        `VoltFlow subtask contract: Before any tool call or other commentary, your first user-visible update must copy the ROUTE sentence verbatim from the assignment's EVIDENCE field; it states the selected model, reasoning effort, and a one-sentence reason. ${prefix === null ? "" : `Run ${prefix} from the assigned worktree; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
     },
   };
 }
@@ -982,6 +984,12 @@ function testOutputFailed(response) {
 
 function shellSegments(command) {
   return command.split(/&&|\|\||[|;&\n]/).map((segment) => segment.trim()).filter(Boolean);
+}
+
+function isGitMetadataCommand(command) {
+  const unquoted = command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "quoted");
+  return shellSegments(unquoted).every((segment) =>
+    /^(?:rtk\s+)?git\s+(?:(?:-[Cc]\s+\S+|--(?:git-dir|work-tree)(?:=\S+|\s+\S+))\s+)*(?:add|commit|diff)\b/i.test(segment));
 }
 
 function isDryRunSegment(segment) {

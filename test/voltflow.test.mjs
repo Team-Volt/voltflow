@@ -227,6 +227,8 @@ test("subagent contract limits per-slice TDD to required work", () => {
   assert.match(context, /ordinary documented use/i);
   assert.match(context, /safe and satisfies scope/i);
   assert.match(context, /first user-visible update.*selected model, reasoning effort, and a one-sentence reason/i);
+  assert.match(context, /before any tool call or other commentary/i);
+  assert.match(context, /copy.*route sentence.*verbatim.*EVIDENCE/i);
 });
 
 test("active v2 spawns require isolated context", () => {
@@ -1163,6 +1165,45 @@ test("shell mutations and freeform patches cannot bypass RED tracking", () => {
   const state = loadState(fx.dataDir, "session-1");
   assert.equal(state.changed, true);
   assert.equal(state.tddViolation, true);
+});
+
+test("extensionless production shell mutations still require RED", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Fix the launcher" }), fx.options);
+  start(fx);
+  handleHook(input("PostToolUse", {
+    tool_name: "exec_command",
+    tool_input: { cmd: "rtk sed -i s/a/b/ app" },
+    tool_response: { exit_code: 0 },
+  }), { ...fx.options, fingerprint: () => "extensionless-production" });
+  assert.equal(loadState(fx.dataDir, "session-1").tddViolation, true);
+});
+
+test("Git staging and commits after GREEN do not create TDD violations", () => {
+  for (const command of [
+    "git add src/app.mjs",
+    "rtk git -C 'work dir' add src/app.mjs",
+    "rtk git add src/app.mjs && rtk git diff --cached --check && rtk git commit -m 'fix parser; preserve cache'",
+  ]) {
+    const fx = fixture();
+    handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);
+    start(fx);
+    failedTest(fx);
+    fx.setFingerprint("production");
+    recordProductionEdit(fx);
+    fx.setFingerprint("green-artifact");
+    passedTest(fx);
+
+    handleHook(input("PostToolUse", {
+      tool_name: "exec_command",
+      tool_input: { cmd: command },
+      tool_response: { exit_code: 0 },
+    }), { ...fx.options, fingerprint: () => "git-metadata" });
+    const state = loadState(fx.dataDir, "session-1");
+    assert.equal(state.tddViolation, false, command);
+    assert.equal(state.validation, null, command);
+    assert.equal(state.reworkCycles, 0, command);
+  }
 });
 
 test("only executed successful tests create validation evidence", () => {
