@@ -39,7 +39,7 @@ Direct `model` and `reasoning_effort` overrides are used when the active spawn s
 
 VoltFlow never selects `ultra` reasoning for a subagent. An explicit `ultra` request is rejected as a policy conflict rather than replaced with another effort.
 
-The complete selection rubric is in [routing.md](skills/voltflow/references/routing.md). The chosen model, effort, and task-based rationale are recorded with the assignment or result so routing decisions remain reviewable.
+The complete selection rubric is in [routing.md](skills/voltflow/references/routing.md). Before each spawn, the main session reports the chosen model, reasoning effort, and a one-sentence reason. The assignment records them, and the subagent repeats them in its first update, so the route remains understandable inside the subagent session even when Codex hides spawn metadata.
 
 ## Multi-agent compatibility
 
@@ -49,6 +49,14 @@ VoltFlow does not call a subagent API from its Node runtime. The main Codex agen
 - Multi-agent v2 uses the flat `spawn_agent` shape with `task_name`, `message`, and `fork_turns: "none"`. VoltFlow never uses full-history inheritance for a v2 spawn. It passes model settings only when that schema exposes them; otherwise it uses a verified non-ultra profile or parent, or refuses the spawn.
 
 The lifecycle hooks consume `SubagentStart` and `SubagentStop`, so review receipts are independent of the spawn API version. Both host schemas are supported; the active schema still determines whether direct model and reasoning overrides are available.
+
+### Git worktrees
+
+VoltFlow supports subagents working in linked Git worktrees under one Codex task. The main agent still creates each worktree, assigns its branch and path, integrates the result, and removes the worktree when it is no longer needed.
+
+Command tools normally select a worktree from their `workdir`, while edit tools use the paths they change. Some hosts report a subagent's commands with the parent cwd and no `workdir`; the controller binds that agent ID to its assigned worktree when the subagent runs the injected `status` command there. A linked worktree inherits the active tier, TDD mode, and review mode, but keeps its RED, validation, review, and deployment approval state separate.
+
+Run controller commands from the worktree they apply to. Before merging a worker, run `integrate --from <worker-worktree>` in the integration worktree; VoltFlow accepts only current, validated evidence from the same workflow. Validate and review the merged result afterward. Review lanes that share a worktree run one at a time so generated test artifacts cannot stale both fingerprint-bound receipts.
 
 ### Enable multi-agent v2
 
@@ -79,6 +87,10 @@ node <plugin-root>/scripts/voltflow.mjs skip \
 node <plugin-root>/scripts/voltflow.mjs red \
   --data-dir <plugin-data> --session <session-id> \
   --evidence "targeted reproduction failed for the expected reason"
+
+node <plugin-root>/scripts/voltflow.mjs integrate \
+  --data-dir <plugin-data> --session <session-id> \
+  --from <validated-worker-worktree>
 
 node <plugin-root>/scripts/voltflow.mjs validate \
   --data-dir <plugin-data> --session <session-id> \

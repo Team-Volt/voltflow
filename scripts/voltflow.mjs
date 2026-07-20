@@ -9,6 +9,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   statSync,
@@ -21,7 +22,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const TIERS = new Set(["trivial", "standard", "high"]);
 const TDD_MODES = new Set(["required", "exempt"]);
 const REVIEW_MODES = new Set(["self", "single", "split"]);
-const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "review", "approve"]);
+const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "integrate", "review", "approve", "status"]);
 const SPLIT_LANES = new Set(["correctness-security", "validation-scope"]);
 const REVIEW_RANK = { self: 0, single: 1, split: 2 };
 const TIER_RANK = { trivial: 0, standard: 1, high: 2 };
@@ -45,15 +46,18 @@ const DEFAULT_DEPLOY_PATTERNS = [
   /\btwine\b[^\n;&|]*\bupload\b/i,
   /\bgh\b[^\n;&|]*\brelease\b[^\n;&|]*\bcreate\b/i,
 ];
-const TEST_COMMAND = /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|^node\s+--test\b|^(?:pytest|vitest|jest|rspec|phpunit)\b|^python(?:3)?\s+-m\s+pytest\b|^(?:go|cargo|dotnet|swift|mix)\s+test\b|^(?:mvn|gradle|gradlew|xcodebuild)\b[^\n]*\btest\b/i;
+const TEST_COMMAND = /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|^node\s+--test\b|^(?:pytest|vitest|jest|rspec|phpunit)\b|^python(?:3)?(?:\s+-[a-z]+)*\s+(?:-m\s+(?:pytest|unittest)\b|(?:tests?\/\S+|(?:\S+\/)?test[^/\s]*)\.py\b)|^(?:go|cargo|dotnet|swift|mix)\s+test\b|^(?:mvn|gradle|gradlew|xcodebuild)\b[^\n]*\btest\b/i;
+const NON_EXECUTING_COMMANDS = /^(?:echo|printf|rg|grep|sed|cat|head|tail|less|man|type|which|whereis)$/i;
+const TEST_OUTPUT = /(?:^|\n)(?:TAP version|(?:not )?ok \d+\s+-|Ran \d+ tests?|FAILED \(|OK\s*$|=+ .* (?:passed|failed|error)|test result:|Tests run:|(?:Test Files|Tests):\s+.*(?:passed|failed)|(?:PASS|FAIL)\s+\S+\.(?:test|spec)\.)/im;
 const OVERRIDE_INTENT = /^\s*(?:(?:voltflow[:,]?\s+)?(?:please\s+)?(?:override|bypass|waive)\s+(?:the\s+)?(?:deployment\s+)?(?:gate|review|approval)\b[^\n]*\b(?:deploy|release|ship)\b|(?:voltflow[:,]?\s+)?(?:please\s+)?(?:deploy|release|ship)\b[^\n]{0,160}\b(?:anyway|regardless|despite|without\s+(?:a\s+|the\s+)?(?:review|approval|gate))\b[^\n]*)[.!]?\s*$/i;
 const OVERRIDE_QUESTION = /^\s*(?:how|what|when|where|why|who|(?:can|could|should|would|do)\s+(?:i|we)|is\s+it)\b/i;
 const OVERRIDE_NEGATION = /\b(?:do\s+not|don't|dont|never)\s+(?:\w+\s+){0,2}(?:override|bypass|ignore|overrule|waive|deploy|release|ship)\b/i;
 const USAGE = [
-  "Usage: voltflow.mjs start|skip|red|validate|review|approve|status|gate --session <id>",
+  "Usage: voltflow.mjs start|skip|red|validate|integrate|review|approve|status|gate --session <id>",
   "start: --tier trivial|standard|high --tdd required|exempt --review self|single|split",
   "skip: --evidence <reason> (simple work only, before any change)",
   "red|validate: --evidence <text>",
+  "integrate: --from <validated worker worktree>",
   "review: --lane composite|correctness-security|validation-scope",
   "approve: --self --evidence <text>",
 ].join("\n");
@@ -70,7 +74,7 @@ export function handleHook(input, options = {}) {
     case "PostToolUse":
       return onPostToolUse(input, context);
     case "SubagentStart":
-      return onSubagentStart();
+      return onSubagentStart(input, context);
     case "SubagentStop":
       return onSubagentStop(input, context);
     case "Stop":
@@ -95,11 +99,14 @@ export function runController(argv, options = {}) {
     return withStateLock(dataDir, sessionId, () => runController(argv, { ...options, locked: true }));
   }
   const currentFingerprint = fingerprint(cwd);
-  const loaded = loadState(dataDir, sessionId);
-  if (loaded !== null && !sameWorkspace(loaded.cwd, cwd)) {
-    return failure(`session belongs to a different workspace: ${loaded.cwd}`);
+  const loaded = loadState(dataDir, sessionId, cwd);
+  const related = relatedState(dataDir, sessionId, cwd);
+  if (loaded === null && related === null && loadSessionStates(dataDir, sessionId).length > 0) {
+    return failure("session belongs to a different Git repository");
   }
-  const state = loaded ?? freshState(sessionId, cwd, null, currentFingerprint);
+  const state = newerWorkflow(related, loaded)
+    ? inheritedState(sessionId, cwd, related, currentFingerprint)
+    : loaded ?? inheritedState(sessionId, cwd, related, currentFingerprint);
 
   if (command === "start") {
     if (!TIERS.has(flags.tier) || !TDD_MODES.has(flags.tdd) || !REVIEW_MODES.has(flags.review)) {
@@ -119,15 +126,12 @@ export function runController(argv, options = {}) {
         return failure(`cannot change an active workflow from tdd=${state.tdd} to tdd=${flags.tdd}`);
       }
       if (flags.tier !== state.tier || flags.review !== state.reviewMode) {
-        state.reviewAssignments = [];
-        state.reviewPasses = [];
-        state.reviewFailure = null;
-        state.approval = null;
+        invalidateReview(state);
       }
       state.tier = flags.tier;
       state.reviewMode = flags.review;
       state.updatedAt = timestamp();
-      saveState(dataDir, state);
+      saveStartedState(dataDir, state);
       return success(`VoltFlow updated: ${flags.tier}, tdd=${flags.tdd}, review=${flags.review}`);
     }
     Object.assign(state, {
@@ -153,7 +157,7 @@ export function runController(argv, options = {}) {
       valueWarningIssued: false,
       updatedAt: timestamp(),
     });
-    saveState(dataDir, state);
+    saveStartedState(dataDir, state);
     return success(`VoltFlow started: ${flags.tier}, tdd=${flags.tdd}, review=${flags.review}`);
   }
 
@@ -199,6 +203,25 @@ export function runController(argv, options = {}) {
     return success("VoltFlow validation recorded");
   }
 
+  if (command === "integrate") {
+    if (typeof flags.from !== "string") return failure("integrate requires --from <worker worktree>");
+    const source = loadState(dataDir, sessionId, flags.from);
+    if (source === null || !sameRepository(cwd, source.cwd) || sameWorkspace(cwd, source.cwd)) {
+      return failure("integration source must be a linked worktree in the same Git repository");
+    }
+    if ((source.workflowId ?? source.promptHash) !== (state.workflowId ?? state.promptHash)) {
+      return failure("integration source belongs to a different workflow");
+    }
+    const sourceFingerprint = fingerprint(source.cwd);
+    const blocker = evidenceBlocker(source, sourceFingerprint);
+    if (blocker !== null) return failure(`integration source is not ready: ${blocker}`);
+    state.red = evidence(`validated worker evidence from ${source.cwd}`, currentFingerprint);
+    state.redObserved = state.red;
+    state.updatedAt = timestamp();
+    saveState(dataDir, state);
+    return success("VoltFlow integration evidence adopted");
+  }
+
   if (command === "review") {
     const allowed = state.reviewMode === "single" ? new Set(["composite"]) : SPLIT_LANES;
     if (!allowed.has(flags.lane)) return failure(`review lane is invalid for review=${state.reviewMode}`);
@@ -223,6 +246,14 @@ export function runController(argv, options = {}) {
   }
 
   if (command === "status") {
+    if (flags.agent !== undefined) {
+      if (typeof flags.agent !== "string" || !/^[a-z0-9_-]{1,128}$/i.test(flags.agent)) {
+        return failure("--agent must contain only letters, numbers, underscores, or hyphens");
+      }
+      state.agentIds ??= [];
+      if (!state.agentIds.includes(flags.agent)) state.agentIds.push(flags.agent);
+    }
+    if (state !== loaded || flags.agent !== undefined) saveState(dataDir, state);
     return success(JSON.stringify(state, null, 2));
   }
 
@@ -235,8 +266,13 @@ export function runController(argv, options = {}) {
   return failure(USAGE);
 }
 
-export function loadState(dataDir, sessionId) {
-  const file = statePath(dataDir, sessionId);
+export function loadState(dataDir, sessionId, cwd) {
+  const primary = loadStateFile(statePath(dataDir, sessionId), sessionId);
+  if (cwd === undefined || primary !== null && sameWorkspace(primary.cwd, cwd)) return primary;
+  return loadStateFile(worktreeStatePath(dataDir, sessionId, cwd), sessionId);
+}
+
+function loadStateFile(file, sessionId) {
   if (!existsSync(file)) return null;
   try {
     const value = JSON.parse(readFileSync(file, "utf8"));
@@ -305,8 +341,7 @@ function onUserPrompt(input, context) {
 
 function onUserPromptLocked(input, context) {
   if (typeof input.prompt !== "string" || typeof input.session_id !== "string") return null;
-  const loaded = loadState(context.dataDir, input.session_id);
-  const previous = loaded !== null && sameWorkspace(loaded.cwd, input.cwd) ? loaded : null;
+  const previous = loadState(context.dataDir, input.session_id, input.cwd);
   const overrideReason = deploymentOverrideReason(input.prompt);
   const current = context.fingerprint(input.cwd);
 
@@ -324,9 +359,13 @@ function onUserPromptLocked(input, context) {
   }
 
   const unfinished = previous?.changed === true && previous.approval?.fingerprint !== current;
-  const state = previous?.active === true || unfinished
+  const continuing = previous?.active === true || unfinished;
+  const state = continuing
     ? previous
     : freshState(input.session_id, input.cwd, previous, current);
+  const previousPromptHash = state.promptHash;
+  const previousWorkflowId = state.workflowId;
+  if (continuing && typeof state.workflowId !== "string") state.workflowId = randomUUID();
   state.active = true;
   state.promptHash = createHash("sha256").update(input.prompt).digest("hex");
   state.stopBlocks = 0;
@@ -334,9 +373,19 @@ function onUserPromptLocked(input, context) {
   state.valueWarningIssued = false;
   state.updatedAt = timestamp();
   saveState(context.dataDir, state);
+  if (continuing) {
+    for (const related of relatedStates(context.dataDir, input.session_id, input.cwd)) {
+      const sameWorkflow = typeof previousWorkflowId === "string"
+        ? related.workflowId === previousWorkflowId
+        : related.workflowId === undefined && related.promptHash === previousPromptHash;
+      if (!sameWorkflow) continue;
+      related.workflowId = state.workflowId;
+      related.promptHash = state.promptHash;
+      saveState(context.dataDir, related);
+    }
+  }
 
-  const script = path.join(context.pluginRoot, "scripts", "voltflow.mjs");
-  const prefix = `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(input.session_id)}`;
+  const prefix = controllerPrefix(context, input.session_id);
   const configNote = context.configError === null ? "" : ` Config warning: ${context.configError}`;
   return userContext(
     `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
@@ -357,12 +406,24 @@ function deploymentOverrideReason(prompt) {
 
 function onPreToolUse(input, context) {
   if (typeof input.session_id !== "string" || typeof input.cwd !== "string" || typeof input.tool_name !== "string") return null;
-  const state = loadState(context.dataDir, input.session_id);
-  if (state !== null && !sameWorkspace(state.cwd, input.cwd)) {
-    return deny("VoltFlow blocked the tool: this session belongs to a different workspace.");
+  const workspace = hookWorkspace(input, context);
+  if (workspace.error !== null) return deny(`VoltFlow blocked the tool: ${workspace.error}`);
+  if (workspace.unmanaged === true) return null;
+  const state = withStateLock(context.dataDir, input.session_id, () => {
+    const existing = loadState(context.dataDir, input.session_id, workspace.cwd);
+    const related = relatedState(context.dataDir, input.session_id, workspace.cwd);
+    if (existing !== null && !newerWorkflow(related, existing)) return existing;
+    if (related === null) return null;
+    const inherited = inheritedState(input.session_id, workspace.cwd, related, context.fingerprint(workspace.cwd));
+    saveState(context.dataDir, inherited);
+    return inherited;
+  });
+  if (state === null && loadSessionStates(context.dataDir, input.session_id).length > 0) {
+    return deny("VoltFlow blocked the tool: this session has no workflow state for that Git repository.");
   }
-  if (context.configError !== null && isCommandTool(input.tool_name)) {
-    return deny(`VoltFlow configuration must be fixed before command execution: ${context.configError}`);
+  const configError = loadProjectConfig(workspace.cwd).error;
+  if (configError !== null && isCommandTool(input.tool_name)) {
+    return deny(`VoltFlow configuration must be fixed before command execution: ${configError}`);
   }
   if (
     state?.active === true
@@ -374,18 +435,18 @@ function onPreToolUse(input, context) {
     return deny('VoltFlow requires v2 subagents to use fork_turns: "none".');
   }
 
-  if (isDeployInvocation(input.tool_name, input.tool_input, input.cwd)) {
+  if (isDeployInvocation(input.tool_name, input.tool_input, workspace.cwd)) {
     if (state === null) return deny("VoltFlow blocked deployment: no workflow state or review receipt exists.");
-    const current = context.fingerprint(input.cwd);
+    const current = context.fingerprint(workspace.cwd);
     const gate = gateStatus(state, current);
     if (!gate.allowed) return deny(`VoltFlow blocked deployment: ${gate.reason}`);
     if (gate.source === "user override") {
       return withStateLock(context.dataDir, input.session_id, () => {
-        const fresh = loadState(context.dataDir, input.session_id);
-        if (fresh === null || !sameWorkspace(fresh.cwd, input.cwd)) {
+        const fresh = loadState(context.dataDir, input.session_id, workspace.cwd);
+        if (fresh === null) {
           return deny("VoltFlow blocked deployment: workflow state changed before the override could be consumed.");
         }
-        const freshGate = gateStatus(fresh, context.fingerprint(input.cwd));
+        const freshGate = gateStatus(fresh, context.fingerprint(workspace.cwd));
         if (freshGate.source !== "user override") {
           return deny(`VoltFlow blocked deployment: ${freshGate.reason ?? "the one-shot override was already consumed"}.`);
         }
@@ -419,27 +480,35 @@ function onPostToolUse(input, context) {
 
 function onPostToolUseLocked(input, context) {
   if (typeof input.session_id !== "string" || typeof input.cwd !== "string") return null;
-  const state = loadState(context.dataDir, input.session_id);
-  if (state?.active !== true || !sameWorkspace(state.cwd, input.cwd)) return null;
-  const failed = toolFailed(input.tool_response);
-  const current = context.fingerprint(input.cwd);
+  const workspace = hookWorkspace(input, context);
+  if (workspace.error !== null) return null;
+  if (workspace.unmanaged === true) return null;
+  const state = loadState(context.dataDir, input.session_id, workspace.cwd);
+  if (state?.active !== true) return null;
+  const current = context.fingerprint(workspace.cwd);
   const recoveredViolation = recoverRevertedViolation(state, current);
 
   const editTool = typeof input.tool_name === "string" && isEditTool(input.tool_name);
   const command = typeof input.tool_name === "string" && isCommandTool(input.tool_name)
     ? commandFrom(input.tool_input)
     : null;
+  const testCommand = command !== null && isTestCommand(command, input.tool_response);
+  const failed = toolFailed(input.tool_response) || testCommand && testOutputFailed(input.tool_response);
   const fingerprintChanged = current !== null && state.lastFingerprint !== null && current !== state.lastFingerprint;
+  const gitMetadataCommand = command !== null && isGitMetadataCommand(command);
   let valueWarning = null;
   if ((!failed && editTool) || fingerprintChanged) {
     const paths = editedPaths(input.tool_input);
     const testOnlyEdit = editTool && paths.length > 0 && paths.every(isTestPath);
-    const touchesTest = (editTool && paths.some(isTestPath)) || (command !== null && commandMentionsTestPath(command));
-    const touchesProduction = (editTool && paths.some((file) => !isTestPath(file)))
-      || (command !== null && commandMentionsProductionPath(command));
+    const touchesTest = testCommand || (editTool && paths.some(isTestPath)) || (command !== null && commandMentionsTestPath(command));
+    const touchesProduction = !testCommand && !gitMetadataCommand && (
+      (editTool && paths.some((file) => !isTestPath(file)))
+      || (command !== null && commandMentionsProductionPath(command))
+    );
     if (
       state.validation?.fingerprint === state.lastFingerprint
       && !testOnlyEdit
+      && !gitMetadataCommand
       && (touchesProduction || (fingerprintChanged && command !== null))
     ) {
       state.reworkCycles = (state.reworkCycles ?? 0) + 1;
@@ -448,7 +517,7 @@ function onPostToolUseLocked(input, context) {
         valueWarning = { systemMessage: VALUE_WARNING };
       }
     }
-    if (state.tdd === "required" && state.red === null && state.tddViolation !== true && !testOnlyEdit && !recoveredViolation) {
+    if (state.tdd === "required" && state.red === null && state.tddViolation !== true && !testOnlyEdit && !testCommand && !gitMetadataCommand && !recoveredViolation) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
     }
@@ -463,7 +532,7 @@ function onPostToolUseLocked(input, context) {
     invalidateForChange(state);
   }
 
-  if (command !== null && isTestCommand(command)) {
+  if (testCommand) {
     if (failed && state.tdd === "required" && state.tddViolation !== true) {
       state.red = evidence(command, current);
       state.redObserved = state.red;
@@ -476,12 +545,15 @@ function onPostToolUseLocked(input, context) {
   return valueWarning;
 }
 
-function onSubagentStart() {
+function onSubagentStart(input, context) {
+  const prefix = typeof input.session_id === "string"
+    ? controllerPrefix(context, input.session_id, typeof input.agent_id === "string" ? input.agent_id : null)
+    : null;
   return {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        "VoltFlow subtask contract: stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.",
+        `VoltFlow subtask contract: Before any tool call or other commentary, your first user-visible update must copy the ROUTE sentence verbatim from the assignment's EVIDENCE field; it states the selected model, reasoning effort, and a one-sentence reason. ${prefix === null ? "" : `Run ${prefix} from the assigned worktree; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
     },
   };
 }
@@ -493,15 +565,16 @@ function onSubagentStop(input, context) {
 
 function onSubagentStopLocked(input, context) {
   if (typeof input.session_id !== "string" || typeof input.last_assistant_message !== "string") return null;
-  const state = loadState(context.dataDir, input.session_id);
-  if (state === null || !sameWorkspace(state.cwd, input.cwd)) return null;
   const result = /(?:^|\n)VOLTFLOW_REVIEW:\s*(PASS|FAIL)\s+([a-z0-9][a-z0-9_-]*)\s+([a-f0-9-]+)\s*$/i.exec(
     input.last_assistant_message.trimEnd(),
   );
-  if (result === null || !["single", "split"].includes(state.reviewMode)) return null;
-
+  if (result === null) return null;
   const [, outcome, lane, token] = result;
-  const current = context.fingerprint(input.cwd);
+  const state = loadSessionStates(context.dataDir, input.session_id).find((candidate) =>
+    candidate.reviewAssignments.some((entry) => entry.lane === lane && entry.token === token));
+  if (state === undefined) return { systemMessage: "VoltFlow ignored an unassigned or stale review receipt." };
+  if (!["single", "split"].includes(state.reviewMode)) return null;
+  const current = context.fingerprint(state.cwd);
   const assignment = state.reviewAssignments.find(
     (entry) => entry.lane === lane && entry.token === token && entry.fingerprint === current,
   );
@@ -547,7 +620,7 @@ function onStop(input, context) {
 
 function onStopLocked(input, context) {
   if (typeof input.session_id !== "string") return null;
-  const state = loadState(context.dataDir, input.session_id);
+  const state = loadState(context.dataDir, input.session_id, input.cwd);
   if (state?.active !== true) return null;
   if (!state.changed) {
     state.active = false;
@@ -584,6 +657,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     version: 1,
     sessionId,
     cwd: canonicalWorkspacePath(cwd),
+    workflowId: randomUUID(),
     active: true,
     tier: "unclassified",
     tdd: "unclassified",
@@ -606,10 +680,25 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     stopBlocks: 0,
     reworkCycles: 0,
     valueWarningIssued: false,
+    agentIds: [],
     lastFingerprint: currentFingerprint,
     createdAt: timestamp(),
     updatedAt: timestamp(),
   };
+}
+
+function inheritedState(sessionId, cwd, source, currentFingerprint) {
+  const state = freshState(sessionId, cwd, null, currentFingerprint);
+  if (source === null) return state;
+  Object.assign(state, {
+    active: source.active,
+    tier: source.tier,
+    tdd: source.tdd,
+    reviewMode: source.reviewMode,
+    workflowId: source.workflowId ?? source.promptHash ?? state.workflowId,
+    promptHash: source.promptHash,
+  });
+  return state;
 }
 
 function gateStatus(state, currentFingerprint) {
@@ -639,11 +728,34 @@ function evidenceBlocker(state, currentFingerprint) {
 }
 
 function saveState(dataDir, state) {
-  const file = statePath(dataDir, state.sessionId);
+  const primaryPath = statePath(dataDir, state.sessionId);
+  const primary = loadStateFile(primaryPath, state.sessionId);
+  const file = primary === null || sameWorkspace(primary.cwd, state.cwd)
+    ? primaryPath
+    : worktreeStatePath(dataDir, state.sessionId, state.cwd);
   mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, file);
+}
+
+function saveStartedState(dataDir, state) {
+  saveState(dataDir, state);
+  const workflowId = state.workflowId ?? state.promptHash;
+  for (const related of relatedStates(dataDir, state.sessionId, state.cwd)) {
+    if ((related.workflowId ?? related.promptHash) !== workflowId) continue;
+    if (related.tier !== state.tier || related.reviewMode !== state.reviewMode) {
+      invalidateReview(related);
+    }
+    Object.assign(related, {
+      active: true,
+      tier: state.tier,
+      tdd: state.tdd,
+      reviewMode: state.reviewMode,
+      updatedAt: timestamp(),
+    });
+    saveState(dataDir, related);
+  }
 }
 
 function withStateLock(dataDir, sessionId, operation) {
@@ -683,11 +795,13 @@ function validState(value, sessionId) {
     && value.version === 1
     && value.sessionId === sessionId
     && typeof value.cwd === "string"
+    && (value.workflowId === undefined || typeof value.workflowId === "string")
     && typeof value.active === "boolean"
     && typeof value.changed === "boolean"
     && typeof value.tddViolation === "boolean"
     && (value.reworkCycles === undefined || Number.isInteger(value.reworkCycles))
     && (value.valueWarningIssued === undefined || typeof value.valueWarningIssued === "boolean")
+    && (value.agentIds === undefined || Array.isArray(value.agentIds) && value.agentIds.every((entry) => typeof entry === "string"))
     && ["unclassified", ...TIERS].includes(value.tier)
     && ["unclassified", ...TDD_MODES].includes(value.tdd)
     && ["unclassified", ...REVIEW_MODES].includes(value.reviewMode)
@@ -750,6 +864,49 @@ function statePath(dataDir, sessionId) {
   return path.join(dataDir, "sessions", `${key}.json`);
 }
 
+function worktreeStatePath(dataDir, sessionId, cwd) {
+  const sessionKey = createHash("sha256").update(sessionId).digest("hex");
+  const workspaceKey = createHash("sha256").update(canonicalWorkspacePath(cwd)).digest("hex");
+  return path.join(dataDir, "sessions", sessionKey, `${workspaceKey}.json`);
+}
+
+function loadSessionStates(dataDir, sessionId) {
+  const states = [];
+  const primary = loadStateFile(statePath(dataDir, sessionId), sessionId);
+  if (primary !== null) states.push(primary);
+  const directory = path.join(dataDir, "sessions", createHash("sha256").update(sessionId).digest("hex"));
+  if (!existsSync(directory)) return states;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const state = loadStateFile(path.join(directory, entry.name), sessionId);
+    if (state !== null) states.push(state);
+  }
+  return states;
+}
+
+function relatedState(dataDir, sessionId, cwd) {
+  const primary = loadState(dataDir, sessionId);
+  if (primary !== null) {
+    if (sameWorkspace(primary.cwd, cwd)) return null;
+    if (sameRepository(primary.cwd, cwd)) return primary;
+  }
+  return relatedStates(dataDir, sessionId, cwd)[0] ?? null;
+}
+
+function relatedStates(dataDir, sessionId, cwd) {
+  return loadSessionStates(dataDir, sessionId)
+    .filter((state) => !sameWorkspace(state.cwd, cwd) && sameRepository(state.cwd, cwd));
+}
+
+function newerWorkflow(source, target) {
+  const sourceId = source?.workflowId ?? source?.promptHash;
+  const targetId = target?.workflowId ?? target?.promptHash;
+  return source !== null
+    && target !== null
+    && typeof sourceId === "string"
+    && sourceId !== targetId;
+}
+
 function editedPaths(toolInput) {
   const direct = isRecord(toolInput)
     ? [toolInput.path, toolInput.file_path, toolInput.filePath].filter((value) => typeof value === "string")
@@ -760,8 +917,37 @@ function editedPaths(toolInput) {
       ? toolInput.patch
       : commandFrom(toolInput);
   if (patch === null) return direct;
-  const paths = [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)].map((match) => match[1].trim());
+  const paths = [...patch.matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File:|Move to:)\s*(.+)$/gm)].map((match) => match[1].trim());
   return [...new Set([...direct, ...paths])];
+}
+
+function hookWorkspace(input, context) {
+  const assigned = typeof input.session_id === "string" && typeof input.agent_id === "string"
+    ? loadSessionStates(context.dataDir, input.session_id).find((state) => state.agentIds?.includes(input.agent_id))
+    : undefined;
+  const base = assigned?.cwd ?? input.cwd;
+  const workdirs = new Set(workdirsFrom(input.tool_input).map((workdir) => {
+    const resolved = path.resolve(base, workdir);
+    return gitWorktreeRoot(resolved) ?? canonicalPath(resolved);
+  }));
+  if (!isEditTool(input.tool_name) && workdirs.size > 1) {
+    return { cwd: base, error: "one command tool cannot span multiple worktrees", unmanaged: false };
+  }
+  if (!isEditTool(input.tool_name) && workdirs.size === 1) {
+    return { cwd: workdirs.values().next().value, error: null, unmanaged: false };
+  }
+  if (!isEditTool(input.tool_name)) return { cwd: base, error: null, unmanaged: false };
+  const baseRoot = gitWorktreeRoot(base);
+  if (baseRoot === null) return { cwd: base, error: null, unmanaged: false };
+  const paths = editedPaths(input.tool_input);
+  const resolvedRoots = paths.map((file) => gitWorktreeRoot(path.resolve(base, file)));
+  const roots = new Set(resolvedRoots.filter((root) => root !== null));
+  if (roots.size > 1) return { cwd: base, error: "one edit cannot span multiple Git worktrees", unmanaged: false };
+  if (roots.size > 0 && resolvedRoots.includes(null)) {
+    return { cwd: base, error: "one edit cannot span managed and external paths", unmanaged: false };
+  }
+  if (paths.length > 0 && roots.size === 0) return { cwd: base, error: null, unmanaged: true };
+  return { cwd: roots.values().next().value ?? baseRoot ?? base, error: null, unmanaged: false };
 }
 
 function isTestPath(file) {
@@ -769,14 +955,41 @@ function isTestPath(file) {
   return /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^/]+$/.test(normalized);
 }
 
-function isTestCommand(command) {
+function isTestCommand(command, response) {
   if (/&&|\|\||[|;&\n]/.test(command)) return false;
   const segments = shellSegments(command);
-  return segments.length === 1 && TEST_COMMAND.test(segments[0].trim());
+  if (segments.length !== 1) return false;
+  const segment = segments[0].trim();
+  if (TEST_COMMAND.test(segment)) return true;
+  const [wrapper, ...rest] = segment.split(/\s+/);
+  return rest.length > 0
+    && !NON_EXECUTING_COMMANDS.test(wrapper)
+    && TEST_COMMAND.test(rest.join(" "))
+    && TEST_OUTPUT.test(toolResponseText(response));
+}
+
+function toolResponseText(response) {
+  if (typeof response === "string") return response;
+  if (Array.isArray(response)) return response.map(toolResponseText).join("\n");
+  if (!isRecord(response)) return "";
+  return [response.text, response.output, response.stdout, response.stderr, response.content]
+    .map(toolResponseText)
+    .filter(Boolean)
+    .join("\n");
+}
+
+function testOutputFailed(response) {
+  return /(?:^|\n)(?:not ok \d+\s+-|FAILED \([^\n)]*failures=[1-9]\d*|=+ .* [1-9]\d* failed|test result: FAILED|Tests:\s+.*[1-9]\d* failed|Tests run:.*Failures:\s*[1-9]\d*)/im.test(toolResponseText(response));
 }
 
 function shellSegments(command) {
   return command.split(/&&|\|\||[|;&\n]/).map((segment) => segment.trim()).filter(Boolean);
+}
+
+function isGitMetadataCommand(command) {
+  const unquoted = command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "quoted");
+  return shellSegments(unquoted).every((segment) =>
+    /^(?:rtk\s+)?git\s+(?:(?:-[Cc]\s+\S+|--(?:git-dir|work-tree)(?:=\S+|\s+\S+))\s+)*(?:add|commit|diff)\b/i.test(segment));
 }
 
 function isDryRunSegment(segment) {
@@ -811,7 +1024,10 @@ function isCommandTool(toolName) {
 }
 
 function commandFrom(toolInput) {
-  if (typeof toolInput === "string") return toolInput;
+  if (typeof toolInput === "string") {
+    const nested = nestedExecInputs(toolInput);
+    return nested.length === 0 ? toolInput : nested.map((input) => input.cmd).join("\n");
+  }
   if (!isRecord(toolInput)) return null;
   for (const key of ["command", "cmd"]) {
     if (typeof toolInput[key] === "string") return toolInput[key];
@@ -819,10 +1035,39 @@ function commandFrom(toolInput) {
   return null;
 }
 
+function workdirsFrom(toolInput) {
+  if (isRecord(toolInput) && typeof toolInput.workdir === "string") return [toolInput.workdir];
+  return typeof toolInput === "string"
+    ? nestedExecInputs(toolInput).map((input) => input.workdir ?? ".")
+    : [];
+}
+
+function nestedExecInputs(source) {
+  const marker = "tools.exec_command(";
+  const starts = [];
+  for (let start = source.indexOf(marker); start !== -1; start = source.indexOf(marker, start + marker.length)) {
+    starts.push(start);
+  }
+  const property = (name, call) => {
+    const match = new RegExp(`(?:^|[,{])\\s*(?:"${name}"|${name})\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`).exec(call);
+    if (match === null) return null;
+    try {
+      return JSON.parse(match[1]);
+    } catch {
+      return null;
+    }
+  };
+  return starts.flatMap((start, index) => {
+    const call = source.slice(start, starts[index + 1] ?? source.length);
+    const cmd = property("cmd", call);
+    return cmd === null ? [] : [{ cmd, workdir: property("workdir", call) }];
+  });
+}
+
 function toolFailed(response) {
   if (typeof response === "string") {
     if (/^Success\b/i.test(response) || /\b0\s+failed\b/i.test(response)) return false;
-    const exit = /(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?|exit_code)\D*(-?\d+)/i.exec(response);
+    const exit = /(?:^|\n)\s*(?:Process\s+)?(?:exited(?:\s+with)?(?:\s+code)?|exit(?:\s+code)?|exit_code)\s*[:=]?\s*(-?\d+)(?:\s|$)/im.exec(response);
     if (exit !== null) return Number(exit[1]) !== 0;
     return /\b[1-9]\d*\s+failed\b|\b(?:error|failure)\b/i.test(response);
   }
@@ -960,6 +1205,12 @@ function historicalRed(state) {
   return state.redObserved ?? state.red;
 }
 
+function controllerPrefix(context, sessionId, agentId = null) {
+  const script = path.join(context.pluginRoot, "scripts", "voltflow.mjs");
+  const agent = agentId === null ? "" : ` --agent ${quote(agentId)}`;
+  return `node ${quote(script)} <command> --data-dir ${quote(context.dataDir)} --session ${quote(sessionId)}${agent}`;
+}
+
 function quote(value) {
   return process.platform === "win32"
     ? `'${value.replaceAll("'", "''")}'`
@@ -988,6 +1239,53 @@ function sameWorkspace(left, right) {
 }
 
 function canonicalWorkspacePath(value) {
+  return gitWorktreeRoot(value) ?? canonicalPath(value);
+}
+
+function sameRepository(left, right) {
+  const leftCommon = gitCommonDirectory(left);
+  const rightCommon = gitCommonDirectory(right);
+  return leftCommon !== null && leftCommon === rightCommon;
+}
+
+function gitWorktreeRoot(value) {
+  const result = gitMetadata(value, ["rev-parse", "--show-toplevel"]);
+  return result.ok ? canonicalPath(result.stdout.trim()) : null;
+}
+
+function gitCommonDirectory(value) {
+  const result = gitMetadata(value, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return result.ok ? canonicalPath(result.stdout.trim()) : null;
+}
+
+function gitMetadata(value, args) {
+  let current = path.resolve(value);
+  while (true) {
+    if (existsSync(current)) {
+      try {
+        if (statSync(current).isDirectory()) {
+          const result = git(current, args);
+          if (result.ok) return result;
+        }
+      } catch {
+        // Continue through lexical parents when a path cannot be resolved.
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return git(nearestExistingDirectory(value), args);
+}
+
+function nearestExistingDirectory(value) {
+  let current = path.resolve(value);
+  while (!existsSync(current) && path.dirname(current) !== current) current = path.dirname(current);
+  const canonical = canonicalPath(current);
+  return statSync(canonical).isDirectory() ? canonical : path.dirname(canonical);
+}
+
+function canonicalPath(value) {
   const resolved = path.resolve(value);
   try {
     return realpathSync.native(resolved);
@@ -1010,12 +1308,16 @@ function recoverRevertedViolation(state, currentFingerprint) {
 function invalidateForChange(state) {
   state.changed = true;
   state.validation = null;
+  invalidateReview(state);
+  state.override = null;
+  state.stopBlocks = 0;
+}
+
+function invalidateReview(state) {
   state.reviewAssignments = [];
   state.reviewPasses = [];
   state.reviewFailure = null;
   state.approval = null;
-  state.override = null;
-  state.stopBlocks = 0;
 }
 
 function success(stdout) {

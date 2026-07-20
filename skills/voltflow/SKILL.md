@@ -43,6 +43,10 @@ Record successful automated or manual validation with the controller. A passing 
 
 Read [references/routing.md](references/routing.md) before spawning. Scale concurrent subagents to the number of useful independent slices and the host's available capacity. Parallel writers need disjoint owned paths; serialize shared files and dependencies.
 
+The `SubagentStart` hook supplies the exact controller prefix, including protected data, session, and agent arguments. Run its `status` command from the assigned worktree before other commands; this binds host events that report the parent cwd to the worker state. Assigned paths may be new unless the assignment explicitly requires existing files.
+
+Before merging a worker commit, run `integrate --from <worker-worktree>` from the integration worktree. It adopts evidence only from a linked worktree in the same workflow with current validation and no TDD violation; the merge then invalidates validation and review normally, so validate and review the integrated result.
+
 When the active spawn schema is v2, always set `fork_turns: "none"`. Never use full-history inheritance, including when overriding `model` or `reasoning_effort`.
 
 Never select `ultra` reasoning for a subagent. Do not use a pinned profile or inherit the parent unless its effort is known and not `ultra`; refuse the spawn when no compliant route exists. If the user explicitly requests `ultra`, report the policy conflict instead of substituting another effort.
@@ -52,10 +56,12 @@ Each spawn prompt contains five labeled fields and nothing repetitive:
 - `WORK LAYER`: discovery, planning, implementation, validation, or review.
 - `OUTCOME`: one observable result.
 - `SCOPE`: owned paths or review slice, plus explicit exclusions.
-- `EVIDENCE`: commands, files, or scenarios that prove the result.
+- `EVIDENCE`: begin with one sentence in the form `ROUTE: <model>, <reasoning effort>, because <rationale>.`, followed by commands, files, or scenarios that prove the result.
 - `STOP`: the condition that ends work or requires escalation.
 
 Treat examples as examples, not hidden requirements. When instructions conflict, follow the user outcome, repository invariants, and the bounded assignment in that order. Return a concise result with evidence; do not invent neighboring work to make the assignment look complete.
+
+Before every spawn, tell the user which model and reasoning effort you selected and why in one sentence. Before any tool call or other commentary, the subagent's first user-visible update copies the `ROUTE` sentence verbatim from `EVIDENCE`, so its session stays understandable even when the host hides spawn metadata.
 
 ## Review in proportion to risk
 
@@ -65,7 +71,11 @@ Review the final diff against the request, not against an imagined ideal rewrite
 - `single`: one independent reviewer covers the full checklist.
 - `split`: two reviewers use non-overlapping lanes: correctness/security and validation/scope.
 
-Before spawning each independent reviewer, run the injected controller with `review --lane <lane>`. Put the returned token in the review prompt. The reviewer ends with `VOLTFLOW_REVIEW: PASS <lane> <token>` only when no blocking finding remains, or `VOLTFLOW_REVIEW: FAIL <lane> <token>` after its findings. Receipts without a current assignment are ignored, a failed lane clears earlier passes, and any edit invalidates every receipt.
+Before spawning each independent reviewer, remove generated validation artifacts and confirm the worktree fingerprint is stable, then run the injected controller with `review --lane <lane>`. Put the returned token in the review prompt. The reviewer ends with `VOLTFLOW_REVIEW: PASS <lane> <token>` only when no blocking finding remains, or `VOLTFLOW_REVIEW: FAIL <lane> <token>` after its findings. Receipts without a current assignment are ignored, a failed lane clears earlier passes, and any edit invalidates every receipt.
+
+Serialize reviewers that share a worktree. Their lanes remain independent, but concurrent validation can change generated artifacts between assignment and receipt, which correctly makes both fingerprint-bound tokens stale.
+
+Reviewers must remove only generated artifacts created by their validation, or prevent them with the project's existing no-write option, before returning the receipt. Validation and approval remain worktree-local, so perform final validation and review in the worktree that will pass the deployment gate.
 
 ### Bound review exploration
 
