@@ -6,16 +6,19 @@ import {
   closeSync,
   existsSync,
   lstatSync,
+  mkdtempSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -312,22 +315,9 @@ export function workspaceFingerprint(cwd) {
   const hash = createHash("sha256");
   hashField(hash, "root", root);
 
-  const head = git(root, ["rev-parse", "--verify", "HEAD"]);
-  hashField(hash, "head", head.ok ? head.stdout : "unborn");
-  for (const args of [
-    ["diff", "--binary", "--no-ext-diff"],
-    ["diff", "--binary", "--cached", "--no-ext-diff"],
-  ]) {
-    const result = git(root, args);
-    if (!result.ok) return null;
-    hashField(hash, args.includes("--cached") ? "cached-diff" : "worktree-diff", result.stdout);
-  }
-
-  const untracked = git(root, ["ls-files", "--others", "--exclude-standard", "-z"]);
-  if (!untracked.ok) return null;
-  for (const relativePath of untracked.stdout.split("\0").filter(Boolean).sort()) {
-    if (!hashWorkspacePath(hash, root, relativePath)) return null;
-  }
+  const tree = workspaceTree(root);
+  if (tree === null) return null;
+  hashField(hash, "tree", tree);
 
   const config = loadProjectConfig(root);
   if (config.error !== null) return null;
@@ -337,6 +327,46 @@ export function workspaceFingerprint(cwd) {
     if (!hashWorkspacePath(hash, root, relativePath, true)) return null;
   }
   return hash.digest("hex");
+}
+
+function workspaceTree(root) {
+  const commonDir = git(root, ["rev-parse", "--git-common-dir"]);
+  if (!commonDir.ok) return null;
+  const temporary = mkdtempSync(path.join(tmpdir(), "voltflow-fingerprint-"));
+  const objectDirectory = path.join(temporary, "objects");
+  mkdirSync(objectDirectory);
+  const environment = {
+    GIT_INDEX_FILE: path.join(temporary, "index"),
+    GIT_OBJECT_DIRECTORY: objectDirectory,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: [
+      path.resolve(root, commonDir.stdout.trim(), "objects"),
+      process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES,
+    ].filter(Boolean).join(path.delimiter),
+  };
+  try {
+    const head = git(root, ["rev-parse", "--verify", "HEAD"]);
+    const read = git(root, head.ok ? ["read-tree", head.stdout.trim()] : ["read-tree", "--empty"], environment);
+    if (!read.ok || !git(root, ["add", "-A", "--", "."], environment).ok) return null;
+    const entries = git(root, ["ls-files", "--stage", "-z"], environment);
+    if (!entries.ok) return null;
+    const submodules = [];
+    for (const entry of entries.stdout.split("\0").filter(Boolean)) {
+      const separator = entry.indexOf("\t");
+      if (separator === -1 || !entry.startsWith("160000 ")) continue;
+      const relativePath = entry.slice(separator + 1);
+      const submodulePath = path.join(root, relativePath);
+      const submoduleRoot = git(submodulePath, ["rev-parse", "--show-toplevel"]);
+      if (!submoduleRoot.ok || path.resolve(submoduleRoot.stdout.trim()) !== path.resolve(submodulePath)) return null;
+      const fingerprint = workspaceFingerprint(submodulePath);
+      if (fingerprint === null) return null;
+      submodules.push([relativePath, fingerprint]);
+      if (!git(root, ["update-index", "--force-remove", "--", relativePath], environment).ok) return null;
+    }
+    const tree = git(root, ["write-tree"], environment);
+    return tree.ok ? JSON.stringify([tree.stdout.trim(), submodules]) : null;
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
 }
 
 function onUserPrompt(input, context) {
@@ -1182,9 +1212,10 @@ function hashField(hash, label, value) {
   hash.update(bytes);
 }
 
-function git(cwd, args) {
+function git(cwd, args, environment = {}) {
   const result = spawnSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
+    env: { ...process.env, ...environment },
     maxBuffer: 64 * 1024 * 1024,
   });
   return {

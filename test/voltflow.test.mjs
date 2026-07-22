@@ -1803,8 +1803,7 @@ test("fingerprints distinguish large changes and untracked executable modes", ()
   const first = workspaceFingerprint(root);
   writeFileSync(path.join(root, "large.txt"), "b".repeat(size));
   const second = workspaceFingerprint(root);
-  assert.equal(first, null);
-  assert.equal(second, null);
+  assert.notEqual(first, second);
 
   const modeRoot = mkdtempSync(path.join(tmpdir(), "voltflow-mode-"));
   git(modeRoot, "init", "-q");
@@ -1814,6 +1813,43 @@ test("fingerprints distinguish large changes and untracked executable modes", ()
   const nonExecutable = workspaceFingerprint(modeRoot);
   chmodSync(script, 0o755);
   assert.notEqual(workspaceFingerprint(modeRoot), nonExecutable);
+});
+
+test("fingerprints follow workspace content across staging and commit", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "voltflow-commit-fingerprint-"));
+  git(root, "init", "-q");
+  git(root, "config", "user.email", "qa@example.com");
+  git(root, "config", "user.name", "QA");
+  writeFileSync(path.join(root, "app.txt"), "base\n");
+  git(root, "add", "app.txt");
+  git(root, "commit", "-qm", "base");
+  writeFileSync(path.join(root, "app.txt"), "changed\n");
+  const changed = workspaceFingerprint(root);
+
+  git(root, "add", "app.txt");
+  assert.equal(workspaceFingerprint(root), changed);
+  git(root, "commit", "-qm", "change");
+  assert.equal(workspaceFingerprint(root), changed);
+
+  writeFileSync(path.join(root, "app.txt"), "changed again\n");
+  assert.notEqual(workspaceFingerprint(root), changed);
+});
+
+test("fingerprints include tracked submodule worktree changes", () => {
+  const source = mkdtempSync(path.join(tmpdir(), "voltflow-submodule-source-"));
+  git(source, "init", "-q");
+  git(source, "config", "user.email", "qa@example.com");
+  git(source, "config", "user.name", "QA");
+  writeFileSync(path.join(source, "app.txt"), "base\n");
+  git(source, "add", "app.txt");
+  git(source, "commit", "-qm", "base");
+
+  const root = mkdtempSync(path.join(tmpdir(), "voltflow-submodule-parent-"));
+  git(root, "init", "-q");
+  git(root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "vendor");
+  const clean = workspaceFingerprint(root);
+  writeFileSync(path.join(root, "vendor", "app.txt"), "changed\n");
+  assert.notEqual(workspaceFingerprint(root), clean);
 });
 
 test("configured ignored inputs participate in fingerprints", () => {
