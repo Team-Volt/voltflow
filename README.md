@@ -27,7 +27,7 @@ Behavioral changes follow RED, GREEN, REFACTOR. The hook allows test edits befor
 
 Validation must exercise each changed observable layer. Syntax checks cover syntax only; user-facing web changes need one real browser interaction at a supported viewport, or the final result must mark browser behavior as unverified.
 
-Review receipts use one-time lane assignments and are tied to a Git fingerprint containing HEAD, staged and unstaged diffs, untracked-file content, executable mode bits, and configured ignored inputs. A failed lane or later edit invalidates earlier passes. If Git cannot produce a complete fingerprint, the gate fails closed instead of reusing a partial value.
+Review receipts use one-time lane assignments and are tied to a fingerprint of the workspace's file content, executable modes, and configured ignored inputs. Staging or committing an unchanged workspace keeps the same fingerprint; a material file change invalidates earlier passes. If Git cannot produce a complete fingerprint, the gate fails closed instead of reusing a partial value.
 
 The user can overrule the gate in ordinary language by clearly directing VoltFlow to deploy or release despite the missing gate, review, or approval. Questions, hypotheticals, negated instructions, and ordinary deploy requests do not arm an override. An override works once and only for the current fingerprint, and the agent can't create one through the controller CLI.
 

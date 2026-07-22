@@ -87,7 +87,7 @@ After a failed review, group findings by root cause and rerun only affected cove
 
 ## Gate deployment
 
-Do not run a deployment or release command until the controller reports a passing review for the current Git fingerprint. The fingerprint includes Git state, untracked files, executable mode bits, and configured ignored inputs. If Git or configuration cannot produce it, the gate fails closed. The hook blocks known deployment surfaces; projects can add shell or tool matchers in `.voltflow.json` and place the controller's `gate` command in a same-session local deploy wrapper.
+Do not run a deployment or release command until the controller reports a passing review for the current Git fingerprint. The fingerprint covers workspace file content, executable mode bits, and configured ignored inputs while ignoring staging and commit representation. If Git or configuration cannot produce it, the gate fails closed. The hook blocks known deployment surfaces; projects can add shell or tool matchers in `.voltflow.json` and place the controller's `gate` command in a same-session local deploy wrapper.
 
 Only the user can create an override through a clear natural-language instruction to deploy or release despite the gate, review, or approval. Questions, hypotheticals, negated instructions, and ordinary deploy requests are not overrides. The override is one-shot and bound to the current diff; never infer one from ambiguous language.
 
