@@ -65,6 +65,11 @@ const USAGE = [
 export function handleHook(input, options = {}) {
   if (!isRecord(input) || typeof input.hook_event_name !== "string") return null;
   const context = hookContext(input, options);
+  if (
+    input.hook_event_name !== "UserPromptSubmit"
+    && typeof input.session_id === "string"
+    && !sessionEnabled(context.dataDir, input.session_id)
+  ) return null;
 
   switch (input.hook_event_name) {
     case "UserPromptSubmit":
@@ -341,6 +346,24 @@ function onUserPrompt(input, context) {
 
 function onUserPromptLocked(input, context) {
   if (typeof input.prompt !== "string" || typeof input.session_id !== "string") return null;
+  if (/^\s*\/voltflow\s+off\s*$/i.test(input.prompt)) {
+    setSessionEnabled(context.dataDir, input.session_id, false);
+    for (const state of loadSessionStates(context.dataDir, input.session_id)) {
+      state.active = false;
+      state.changed = false;
+      state.updatedAt = timestamp();
+      saveState(context.dataDir, state);
+    }
+    return userContext("VoltFlow is disabled for this session. Workflow checks and deployment blocking are off until /voltflow on.");
+  }
+  if (/^\s*\/voltflow\s+on\s*$/i.test(input.prompt)) {
+    setSessionEnabled(context.dataDir, input.session_id, true);
+    return userContext("VoltFlow is enabled for this session.");
+  }
+  if (/^\s*\/voltflow\s+status\s*$/i.test(input.prompt)) {
+    return userContext(`VoltFlow is ${sessionEnabled(context.dataDir, input.session_id) ? "enabled" : "disabled"} for this session.`);
+  }
+  if (!sessionEnabled(context.dataDir, input.session_id)) return null;
   const previous = loadState(context.dataDir, input.session_id, input.cwd);
   const overrideReason = deploymentOverrideReason(input.prompt);
   const current = context.fingerprint(input.cwd);
@@ -862,6 +885,20 @@ function validOverride(value) {
 function statePath(dataDir, sessionId) {
   const key = createHash("sha256").update(sessionId).digest("hex");
   return path.join(dataDir, "sessions", `${key}.json`);
+}
+
+function sessionEnabled(dataDir, sessionId) {
+  try {
+    return readFileSync(`${statePath(dataDir, sessionId)}.mode`, "utf8").trim() !== "off";
+  } catch {
+    return true;
+  }
+}
+
+function setSessionEnabled(dataDir, sessionId, enabled) {
+  const file = `${statePath(dataDir, sessionId)}.mode`;
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, `${enabled ? "on" : "off"}\n`, { mode: 0o600 });
 }
 
 function worktreeStatePath(dataDir, sessionId, cwd) {
