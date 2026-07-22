@@ -159,6 +159,8 @@ export function runController(argv, options = {}) {
       approval: null,
       override: null,
       skip: null,
+      baselineFingerprint: currentFingerprint,
+      baselineApproval: null,
       lastFingerprint: currentFingerprint,
       stopBlocks: 0,
       reworkCycles: 0,
@@ -584,6 +586,10 @@ function onPostToolUseLocked(input, context) {
       state.red = null;
     }
     invalidateForChange(state);
+    if (fingerprintChanged && current === state.baselineFingerprint) {
+      state.changed = false;
+      state.approval = state.baselineApproval ?? null;
+    }
   }
 
   if (testCommand) {
@@ -735,6 +741,8 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     reworkCycles: 0,
     valueWarningIssued: false,
     agentIds: [],
+    baselineFingerprint: currentFingerprint,
+    baselineApproval: previous?.approval?.fingerprint === currentFingerprint ? previous.approval : null,
     lastFingerprint: currentFingerprint,
     createdAt: timestamp(),
     updatedAt: timestamp(),
@@ -856,6 +864,8 @@ function validState(value, sessionId) {
     && (value.reworkCycles === undefined || Number.isInteger(value.reworkCycles))
     && (value.valueWarningIssued === undefined || typeof value.valueWarningIssued === "boolean")
     && (value.agentIds === undefined || Array.isArray(value.agentIds) && value.agentIds.every((entry) => typeof entry === "string"))
+    && (value.baselineFingerprint === undefined || value.baselineFingerprint === null || typeof value.baselineFingerprint === "string")
+    && (value.baselineApproval === undefined || value.baselineApproval === null || validApproval(value.baselineApproval))
     && ["unclassified", ...TIERS].includes(value.tier)
     && ["unclassified", ...TDD_MODES].includes(value.tdd)
     && ["unclassified", ...REVIEW_MODES].includes(value.reviewMode)

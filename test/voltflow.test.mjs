@@ -1018,6 +1018,40 @@ test("incomplete Stop reports pending evidence without replacing the response", 
   assert.equal(deploy(fx).hookSpecificOutput.permissionDecision, "deny");
 });
 
+test("returning to the workflow's starting fingerprint preserves completed evidence", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Update the flag" }), fx.options);
+  start(fx, { tier: "trivial", tdd: "exempt", review: "self" });
+  recordProductionEdit(fx);
+  passedTest(fx);
+  assert.equal(
+    runController(
+      ["approve", "--self", "--session", "session-1", "--evidence", "diff inspected"],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode,
+    0,
+  );
+  assert.equal(handleHook(input("Stop", { last_assistant_message: "Done" }), fx.options), null);
+
+  handleHook(input("UserPromptSubmit", { prompt: "Publish the change" }), fx.options);
+  fx.setFingerprint("diff-b");
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "git switch main" },
+    tool_response: { exit_code: 0 },
+  }), fx.options);
+  fx.setFingerprint("diff-a");
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "git pull --ff-only" },
+    tool_response: { exit_code: 0 },
+  }), fx.options);
+
+  assert.equal(handleHook(input("Stop", { last_assistant_message: "Published" }), fx.options), null);
+  assert.equal(loadState(fx.dataDir, "session-1").changed, false);
+  assert.equal(deploy(fx), null);
+});
+
 test("a production write observed before RED cannot be repaired by late evidence", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);
