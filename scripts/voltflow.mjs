@@ -376,7 +376,8 @@ function onUserPrompt(input, context) {
 
 function onUserPromptLocked(input, context) {
   if (typeof input.prompt !== "string" || typeof input.session_id !== "string") return null;
-  if (/^\s*\/voltflow\s+off\s*$/i.test(input.prompt)) {
+  const command = input.prompt.match(/^\s*[/@$]voltflow(?::voltflow)?\s+(off|on|status)\s*$/i)?.[1].toLowerCase();
+  if (command === "off") {
     setSessionEnabled(context.dataDir, input.session_id, false);
     for (const state of loadSessionStates(context.dataDir, input.session_id)) {
       state.active = false;
@@ -386,11 +387,11 @@ function onUserPromptLocked(input, context) {
     }
     return userContext("VoltFlow is disabled for this session. Workflow checks and deployment blocking are off until /voltflow on.");
   }
-  if (/^\s*\/voltflow\s+on\s*$/i.test(input.prompt)) {
+  if (command === "on") {
     setSessionEnabled(context.dataDir, input.session_id, true);
     return userContext("VoltFlow is enabled for this session.");
   }
-  if (/^\s*\/voltflow\s+status\s*$/i.test(input.prompt)) {
+  if (command === "status") {
     return userContext(`VoltFlow is ${sessionEnabled(context.dataDir, input.session_id) ? "enabled" : "disabled"} for this session.`);
   }
   if (!sessionEnabled(context.dataDir, input.session_id)) return null;
