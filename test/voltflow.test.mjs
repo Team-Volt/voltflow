@@ -170,6 +170,58 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
+test("slash command disables all VoltFlow hooks for the session", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Update the parser" }), fx.options);
+
+  const disabled = handleHook(input("UserPromptSubmit", { prompt: "/voltflow off" }), fx.options);
+
+  assert.match(disabled.hookSpecificOutput.additionalContext, /disabled for this session/i);
+  assert.equal(handleHook(input("UserPromptSubmit", { prompt: "Change production" }), fx.options), null);
+  assert.equal(productionPatchDecision(fx), null);
+  assert.equal(deploy(fx), null);
+});
+
+test("disabling abandons the active workflow before it is re-enabled", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Change production" }), fx.options);
+  start(fx);
+  failedTest(fx);
+  recordProductionEdit(fx);
+
+  handleHook(input("UserPromptSubmit", { prompt: "/voltflow off" }), fx.options);
+  handleHook(input("UserPromptSubmit", { prompt: "/voltflow on" }), fx.options);
+
+  assert.equal(handleHook(input("Stop", { last_assistant_message: "Enabled" }), fx.options), null);
+  const nextPrompt = handleHook(input("UserPromptSubmit", { prompt: "Change something else" }), fx.options);
+  assert.match(nextPrompt.hookSpecificOutput.additionalContext, /VoltFlow is active/);
+  assert.equal(loadState(fx.dataDir, "session-1").changed, false);
+});
+
+test("slash command re-enables VoltFlow for the session", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "/voltflow off" }), fx.options);
+
+  const enabled = handleHook(input("UserPromptSubmit", { prompt: "/voltflow on" }), fx.options);
+
+  assert.match(enabled.hookSpecificOutput.additionalContext, /enabled for this session/i);
+  const nextPrompt = handleHook(input("UserPromptSubmit", { prompt: "Change production" }), fx.options);
+  assert.match(nextPrompt.hookSpecificOutput.additionalContext, /VoltFlow is active/);
+  assert.equal(deploy(fx).hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("slash status reports the current session state without changing it", () => {
+  const fx = fixture();
+
+  const enabled = handleHook(input("UserPromptSubmit", { prompt: "/voltflow status" }), fx.options);
+  assert.match(enabled.hookSpecificOutput.additionalContext, /enabled for this session/i);
+
+  handleHook(input("UserPromptSubmit", { prompt: "/voltflow off" }), fx.options);
+  const disabled = handleHook(input("UserPromptSubmit", { prompt: "/voltflow status" }), fx.options);
+  assert.match(disabled.hookSpecificOutput.additionalContext, /disabled for this session/i);
+  assert.equal(handleHook(input("UserPromptSubmit", { prompt: "Change production" }), fx.options), null);
+});
+
 test("simple work can skip workflow ceremony without granting deployment approval", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Fix one typo" }), fx.options);

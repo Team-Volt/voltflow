@@ -17,6 +17,8 @@ Start a new Codex task, run `/hooks`, inspect the VoltFlow hook commands, and tr
 
 ## What it enforces
 
+Run `/voltflow off` to disable every VoltFlow hook, including deployment blocking, for the current Codex session. `/voltflow on` turns it back on, and `/voltflow status` reports the current setting. New sessions start with VoltFlow enabled.
+
 Simple, low-risk edits with no executable behavior or deployment intent can skip the workflow before the first change. The agent records a reason with the controller, then VoltFlow stands down for that prompt: no TDD, validation, fingerprint, review, or Stop warning. Skipping never grants deployment approval.
 
 VoltFlow classifies work as `trivial`, `standard`, or `high`. Each tier has a minimum review mode: self-review for trivial work, one composite reviewer for standard work, and two independent lanes for high-risk work. An active workflow can be upgraded, but it cannot be downgraded to bypass its gate.
