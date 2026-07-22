@@ -182,6 +182,20 @@ test("slash command disables all VoltFlow hooks for the session", () => {
   assert.equal(deploy(fx), null);
 });
 
+test("VoltFlow command aliases disable the session", () => {
+  for (const command of [
+    "/voltflow:voltflow off",
+    "$voltflow off",
+    "$voltflow:voltflow off",
+    "@voltflow off",
+    "@voltflow:voltflow off",
+  ]) {
+    const fx = fixture();
+    handleHook(input("UserPromptSubmit", { prompt: command }), fx.options);
+    assert.equal(handleHook(input("UserPromptSubmit", { prompt: "Change production" }), fx.options), null, command);
+  }
+});
+
 test("disabling abandons the active workflow before it is re-enabled", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Change production" }), fx.options);
