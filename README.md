@@ -23,6 +23,8 @@ Simple, low-risk edits with no executable behavior or deployment intent can skip
 
 VoltFlow classifies work as `trivial`, `standard`, or `high`. Each tier has a minimum review mode: self-review for trivial work, one composite reviewer for standard work, and two independent lanes for high-risk work. An active workflow can be upgraded, but it cannot be downgraded to bypass its gate.
 
+Standard and high work gets a bounded adaptive plan in protected session state. The plan records steps, dependencies, parallel lanes, stop conditions, and capped repeats. Agents create it once with `plan --spec`, then use `plan --step` to change one step without sending the whole plan again. `status --workflow` shows the ready steps and every linked worktree's agent bindings and missing evidence. The plan is coordination state, not an execution engine or approval token, so RED, validation, review, and deployment checks still apply.
+
 Behavioral changes follow RED, GREEN, REFACTOR. The hook allows test edits before RED but blocks production edits until it has observed a failing test or the agent records a manual reproduction. Later test edits clear the current production-edit authorization without erasing the fact that RED occurred, so final review does not demand a fake rerun against already-fixed code. It also detects file changes made through shell commands after they run, so changing the tool name does not bypass evidence invalidation. Only a successful, directly executed test command records automated validation. Prose, generated output, and metadata-only work use `tdd=exempt` with the closest useful validation.
 
 Validation must exercise each changed observable layer. Syntax checks cover syntax only; user-facing web changes need one real browser interaction at a supported viewport, or the final result must mark browser behavior as unverified.
@@ -93,6 +95,18 @@ node <plugin-root>/scripts/voltflow.mjs red \
 node <plugin-root>/scripts/voltflow.mjs integrate \
   --data-dir <plugin-data> --session <session-id> \
   --from <validated-worker-worktree>
+
+node <plugin-root>/scripts/voltflow.mjs plan \
+  --data-dir <plugin-data> --session <session-id> \
+  --spec '{"goal":"Ship the change","steps":[{"id":"implement","action":"Add the behavior","dependsOn":[],"lane":"code","stop":"Focused test passes"}]}'
+
+node <plugin-root>/scripts/voltflow.mjs plan \
+  --data-dir <plugin-data> --session <session-id> \
+  --step '{"id":"implement","status":"done","evidence":"Focused test passed"}'
+
+node <plugin-root>/scripts/voltflow.mjs status \
+  --data-dir <plugin-data> --session <session-id> \
+  --workflow
 
 node <plugin-root>/scripts/voltflow.mjs validate \
   --data-dir <plugin-data> --session <session-id> \

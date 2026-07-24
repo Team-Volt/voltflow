@@ -167,6 +167,10 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /9-second cap/i);
   assert.match(output.hookSpecificOutput.additionalContext, /at most ten/i);
   assert.match(output.hookSpecificOutput.additionalContext, /same assignment/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /standard or high.*after start succeeds.*plan.*--spec/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /evidence changes/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /plan.*--step.*single step/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /status.*--workflow.*ready steps.*worktrees/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
@@ -362,6 +366,192 @@ test("status persists an inherited worktree baseline", () => {
   );
   assert.equal(status.exitCode, 0, status.stderr);
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).cwd, realpathSync(fx.worker));
+});
+
+test("workflow status shows ready plan steps and linked agent bindings", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Ship parallel work",
+      steps: [
+        { id: "code", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes", status: "active" },
+        { id: "docs", action: "Document it", dependsOn: [], lane: "docs", stop: "Docs match behavior" },
+        { id: "shipped", action: "Already done", dependsOn: [], lane: "code", stop: "Done", status: "done", evidence: "Shipped" },
+        { id: "paused", action: "Cannot proceed", dependsOn: [], lane: "code", stop: "Blocked", status: "blocked", evidence: "Waiting on access" },
+        { id: "review", action: "Review it", dependsOn: ["code", "docs"], lane: "review", stop: "Review passes" },
+      ],
+    })],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["status", "--session", "session-1", "--agent", "worker-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: fx.root },
+  );
+  assert.equal(status.exitCode, 0, status.stderr);
+  const workflow = JSON.parse(status.stdout);
+  assert.deepEqual(workflow.readySteps, ["docs"]);
+  assert.equal(workflow.plan.goal, "Ship parallel work");
+  assert.equal(workflow.worktrees.length, 2);
+  assert.deepEqual(workflow.worktrees.find((entry) => entry.cwd === realpathSync(fx.worker)).agentIds, ["worker-1"]);
+  assert.ok(workflow.worktrees.every((entry) => Array.isArray(entry.pending)));
+});
+
+test("adaptive plans are stored in protected state and revised in place", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement the parser" }), fx.options);
+  start(fx);
+  const spec = {
+    goal: "Ship the parser",
+    steps: [
+      { id: "build", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes" },
+      {
+        id: "review",
+        action: "Review it",
+        dependsOn: ["build"],
+        lane: "review",
+        stop: "No material blockers remain",
+        repeat: { max: 2, until: "Review passes" },
+      },
+    ],
+  };
+
+  const first = runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(first.exitCode, 0, first.stderr);
+  const stored = loadState(fx.dataDir, "session-1").plan;
+  assert.deepEqual({ ...stored, updatedAt: undefined }, { ...spec, revision: 1, updatedAt: undefined });
+  assert.equal(typeof stored.updatedAt, "string");
+
+  spec.steps[0].stop = "Focused and regression tests pass";
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 2);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.steps[0].stop, "Focused and regression tests pass");
+
+  for (const invalid of [
+    { goal: "No bound", steps: [{ id: "loop", action: "Retry", dependsOn: [], lane: "code", stop: "Done", repeat: { until: "Done" } }] },
+    { goal: "Unsupported completion", steps: [
+      { id: "done", action: "Finish", dependsOn: [], lane: "code", stop: "Done", status: "done" },
+    ] },
+    { goal: "Unsupported retry", steps: [
+      {
+        id: "retry",
+        action: "Retry",
+        dependsOn: [],
+        lane: "code",
+        stop: "Done",
+        repeat: { max: 2, attempt: 1, until: "Done" },
+      },
+    ] },
+    { goal: "Cycle", steps: [
+      { id: "a", action: "A", dependsOn: ["b"], lane: "code", stop: "Done" },
+      { id: "b", action: "B", dependsOn: ["a"], lane: "code", stop: "Done" },
+    ] },
+  ]) {
+    assert.equal(runController(
+      ["plan", "--session", "session-1", "--spec", JSON.stringify(invalid)],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode, 1);
+  }
+});
+
+test("adaptive plans can revise one step without reposting the full plan", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement the parser" }), fx.options);
+  start(fx);
+  const spec = {
+    goal: "Ship the parser",
+    steps: [
+      { id: "build", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes" },
+      { id: "review", action: "Review it", dependsOn: ["build"], lane: "review", stop: "Review passes" },
+    ],
+  };
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+
+  const premature = runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({
+      id: "review",
+      status: "done",
+      evidence: "Review passed",
+    })],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(premature.exitCode, 1);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 1);
+
+  const revised = runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({
+      id: "build",
+      status: "done",
+      evidence: "Focused test passed",
+    })],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(revised.exitCode, 0, revised.stderr);
+  assert.deepEqual(loadState(fx.dataDir, "session-1").plan.steps, [
+    { ...spec.steps[0], status: "done", evidence: "Focused test passed" },
+    spec.steps[1],
+  ]);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 2);
+
+  const invalid = runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({ id: "review", status: "done" })],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(invalid.exitCode, 1);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 2);
+});
+
+test("adaptive plan revisions propagate across linked worktrees", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const spec = {
+    goal: "Ship parallel work",
+    steps: [
+      { id: "code", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes" },
+      { id: "docs", action: "Document it", dependsOn: [], lane: "docs", stop: "Docs match behavior" },
+    ],
+  };
+
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["status", "--session", "session-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.deepEqual(loadState(fx.dataDir, "session-1", fx.worker).plan.steps, spec.steps);
+
+  spec.steps[0].status = "done";
+  spec.steps[0].evidence = "Focused test passed";
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).plan.revision, 2);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).plan.steps[0].status, "done");
 });
 
 test("restarting a parent workflow reactivates an already-bound worker", () => {
@@ -1169,7 +1359,7 @@ test("an unfinished workflow reactivates when the user says continue", () => {
 test("controller help lists the workflow commands", () => {
   const result = runController(["--help"]);
   assert.equal(result.exitCode, 0);
-  assert.match(result.stdout, /start\|skip\|red\|validate\|integrate\|review\|approve\|status\|gate/);
+  assert.match(result.stdout, /start\|skip\|red\|validate\|integrate\|plan\|review\|approve\|status\|gate/);
 });
 
 function productionPatchDecision(fx) {

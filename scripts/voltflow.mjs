@@ -25,8 +25,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const TIERS = new Set(["trivial", "standard", "high"]);
 const TDD_MODES = new Set(["required", "exempt"]);
 const REVIEW_MODES = new Set(["self", "single", "split"]);
-const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "integrate", "review", "approve", "status"]);
+const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "integrate", "plan", "review", "approve", "status"]);
 const SPLIT_LANES = new Set(["correctness-security", "validation-scope"]);
+const PLAN_STATUSES = new Set(["pending", "active", "done", "blocked"]);
 const REVIEW_RANK = { self: 0, single: 1, split: 2 };
 const TIER_RANK = { trivial: 0, standard: 1, high: 2 };
 const REQUIRED_REVIEW = { trivial: "self", standard: "single", high: "split" };
@@ -56,11 +57,13 @@ const OVERRIDE_INTENT = /^\s*(?:(?:voltflow[:,]?\s+)?(?:please\s+)?(?:override|b
 const OVERRIDE_QUESTION = /^\s*(?:how|what|when|where|why|who|(?:can|could|should|would|do)\s+(?:i|we)|is\s+it)\b/i;
 const OVERRIDE_NEGATION = /\b(?:do\s+not|don't|dont|never)\s+(?:\w+\s+){0,2}(?:override|bypass|ignore|overrule|waive|deploy|release|ship)\b/i;
 const USAGE = [
-  "Usage: voltflow.mjs start|skip|red|validate|integrate|review|approve|status|gate --session <id>",
+  "Usage: voltflow.mjs start|skip|red|validate|integrate|plan|review|approve|status|gate --session <id>",
   "start: --tier trivial|standard|high --tdd required|exempt --review self|single|split",
   "skip: --evidence <reason> (simple work only, before any change)",
   "red|validate: --evidence <text>",
   "integrate: --from <validated worker worktree>",
+  "plan: --spec <JSON> | --step <JSON>",
+  "status: [--agent <id>] [--workflow]",
   "review: --lane composite|correctness-security|validation-scope",
   "approve: --self --evidence <text>",
 ].join("\n");
@@ -153,6 +156,7 @@ export function runController(argv, options = {}) {
       red: null,
       redObserved: null,
       validation: null,
+      plan: null,
       reviewAssignments: [],
       reviewPasses: [],
       reviewFailure: null,
@@ -232,6 +236,51 @@ export function runController(argv, options = {}) {
     return success("VoltFlow integration evidence adopted");
   }
 
+  if (command === "plan") {
+    if (!["standard", "high"].includes(state.tier) || state.active !== true) {
+      return failure("adaptive plans require an active standard or high workflow");
+    }
+    let spec = parsePlanSpec(flags.spec);
+    if (flags.step !== undefined) {
+      const patch = parsePlanStep(flags.step);
+      const existing = state.plan?.steps.find((step) => step.id === patch?.id);
+      if (patch === null || state.plan === null) {
+        return failure("plan --step requires valid JSON and an existing plan");
+      }
+      const step = {
+        ...existing,
+        ...patch,
+        ...(existing?.repeat !== undefined && patch.repeat !== undefined
+          ? { repeat: { ...existing.repeat, ...patch.repeat } }
+          : {}),
+      };
+      spec = {
+        goal: state.plan.goal,
+        steps: existing === undefined
+          ? [...state.plan.steps, step]
+          : state.plan.steps.map((candidate) => candidate.id === step.id ? step : candidate),
+      };
+      if (!validPlan(spec, false)) return failure("plan --step would make the plan invalid");
+    }
+    if (spec === null) return failure("plan requires a valid bounded --spec JSON value");
+    const peers = relatedStates(dataDir, sessionId, cwd).filter((peer) =>
+      (peer.workflowId ?? peer.promptHash) === (state.workflowId ?? state.promptHash));
+    const revision = Math.max(0, ...[state, ...peers].map((entry) => entry.plan?.revision ?? 0)) + 1;
+    const plan = {
+      ...spec,
+      revision,
+      updatedAt: timestamp(),
+    };
+    state.plan = plan;
+    saveState(dataDir, state);
+    for (const peer of peers) {
+      peer.plan = plan;
+      peer.updatedAt = timestamp();
+      saveState(dataDir, peer);
+    }
+    return success(`VoltFlow plan stored: revision=${revision}`);
+  }
+
   if (command === "review") {
     const allowed = state.reviewMode === "single" ? new Set(["composite"]) : SPLIT_LANES;
     if (!allowed.has(flags.lane)) return failure(`review lane is invalid for review=${state.reviewMode}`);
@@ -264,6 +313,27 @@ export function runController(argv, options = {}) {
       if (!state.agentIds.includes(flags.agent)) state.agentIds.push(flags.agent);
     }
     if (state !== loaded || flags.agent !== undefined) saveState(dataDir, state);
+    if (flags.workflow === true) {
+      const workflowId = state.workflowId ?? state.promptHash;
+      const worktrees = loadSessionStates(dataDir, sessionId)
+        .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId && sameRepository(entry.cwd, cwd))
+        .map((entry) => ({
+          cwd: entry.cwd,
+          agentIds: entry.agentIds ?? [],
+          active: entry.active,
+          changed: entry.changed,
+          pending: pendingReasons(entry, fingerprint(entry.cwd)),
+        }));
+      return success(JSON.stringify({
+        workflowId,
+        tier: state.tier,
+        tdd: state.tdd,
+        reviewMode: state.reviewMode,
+        plan: state.plan,
+        readySteps: readyPlanSteps(state.plan),
+        worktrees,
+      }, null, 2));
+    }
     return success(JSON.stringify(state, null, 2));
   }
 
@@ -447,6 +517,8 @@ function onUserPromptLocked(input, context) {
     `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
       `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
       `For a simple, low-risk edit with no deployment intent, replace start with skip and add --evidence <reason>; skip must happen before any change and does not approve deployment. ` +
+      `For standard or high work, after start succeeds run ${prefix.replace("<command>", "plan")} --spec <JSON> to store the bounded adaptive plan; revise it only when evidence changes the work. ` +
+      `Use ${prefix.replace("<command>", "plan")} --step <JSON> to update a single step, and ${prefix.replace("<command>", "status")} --workflow to see ready steps and linked worktrees. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
       `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
       `When a subagent spawn or status reports "Selected model is at capacity", wait 3, 6, and 9 seconds for the first three retries, then use a 9-second cap, for at most ten replacement spawns; preserve the same assignment, model, reasoning, scope, and evidence contract, and stop after the first success or a different error. ` +
@@ -728,6 +800,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     red: null,
     redObserved: null,
     validation: null,
+    plan: null,
     reviewAssignments: [],
     reviewPasses: [],
     reviewFailure: null,
@@ -757,6 +830,7 @@ function inheritedState(sessionId, cwd, source, currentFingerprint) {
     tier: source.tier,
     tdd: source.tdd,
     reviewMode: source.reviewMode,
+    plan: source.plan ?? null,
     workflowId: source.workflowId ?? source.promptHash ?? state.workflowId,
     promptHash: source.promptHash,
   });
@@ -874,6 +948,7 @@ function validState(value, sessionId) {
     && (value.red === null || validEvidence(value.red))
     && (value.redObserved === undefined || value.redObserved === null || validEvidence(value.redObserved))
     && (value.validation === null || validEvidence(value.validation))
+    && (value.plan === undefined || value.plan === null || validPlan(value.plan))
     && Array.isArray(value.reviewAssignments)
     && value.reviewAssignments.every(validReviewAssignment)
     && Array.isArray(value.reviewPasses)
@@ -921,6 +996,86 @@ function validOverride(value) {
     && typeof value.fingerprint === "string"
     && typeof value.consumed === "boolean"
     && typeof value.at === "string";
+}
+
+function parsePlanSpec(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const spec = JSON.parse(value);
+    return validPlan(spec, false) ? spec : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePlanStep(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const step = JSON.parse(value);
+    return isRecord(step) && typeof step.id === "string" ? step : null;
+  } catch {
+    return null;
+  }
+}
+
+function validPlan(value, stored = true) {
+  if (!isRecord(value) || !textWithin(value.goal, 1000) || !Array.isArray(value.steps)) return false;
+  if (value.steps.length === 0 || value.steps.length > 64) return false;
+  if (stored && (!Number.isInteger(value.revision) || value.revision < 1 || typeof value.updatedAt !== "string")) return false;
+  const ids = new Set();
+  for (const step of value.steps) {
+    if (!isRecord(step) || typeof step.id !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(step.id)) return false;
+    if (ids.has(step.id) || !textWithin(step.action, 1000) || !textWithin(step.lane, 100) || !textWithin(step.stop, 1000)) return false;
+    if (!Array.isArray(step.dependsOn) || step.dependsOn.length > 64 || new Set(step.dependsOn).size !== step.dependsOn.length) return false;
+    if (!step.dependsOn.every((id) => typeof id === "string")) return false;
+    if (step.status !== undefined && !PLAN_STATUSES.has(step.status)) return false;
+    if (step.evidence !== undefined && !textWithin(step.evidence, 2000)) return false;
+    if (step.repeat !== undefined && !validRepeat(step.repeat)) return false;
+    if ((["done", "blocked"].includes(step.status) || (step.repeat?.attempt ?? 0) > 0) && !textWithin(step.evidence, 2000)) return false;
+    ids.add(step.id);
+  }
+  if (value.steps.some((step) => step.dependsOn.some((id) => !ids.has(id) || id === step.id))) return false;
+  const statuses = new Map(value.steps.map((step) => [step.id, step.status]));
+  if (value.steps.some((step) =>
+    ["active", "done"].includes(step.status) && step.dependsOn.some((id) => statuses.get(id) !== "done"))) return false;
+  return !planHasCycle(value.steps);
+}
+
+function validRepeat(value) {
+  return isRecord(value)
+    && Number.isInteger(value.max)
+    && value.max >= 1
+    && value.max <= 10
+    && textWithin(value.until, 1000)
+    && (value.attempt === undefined || Number.isInteger(value.attempt) && value.attempt >= 0 && value.attempt <= value.max);
+}
+
+function readyPlanSteps(plan) {
+  if (plan === null || plan === undefined) return [];
+  const done = new Set(plan.steps.filter((step) => step.status === "done").map((step) => step.id));
+  return plan.steps
+    .filter((step) => [undefined, "pending"].includes(step.status) && step.dependsOn.every((id) => done.has(id)))
+    .map((step) => step.id);
+}
+
+function planHasCycle(steps) {
+  const dependencies = new Map(steps.map((step) => [step.id, step.dependsOn]));
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (id) => {
+    if (visiting.has(id)) return true;
+    if (visited.has(id)) return false;
+    visiting.add(id);
+    if (dependencies.get(id).some(visit)) return true;
+    visiting.delete(id);
+    visited.add(id);
+    return false;
+  };
+  return steps.some((step) => visit(step.id));
+}
+
+function textWithin(value, max) {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= max;
 }
 
 function statePath(dataDir, sessionId) {
