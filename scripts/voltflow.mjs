@@ -115,7 +115,12 @@ export function runController(argv, options = {}) {
   if (loaded === null && related === null && loadSessionStates(dataDir, sessionId).length > 0) {
     return failure("session belongs to a different Git repository");
   }
-  const state = newerWorkflow(related, loaded)
+  const historicalStatus = command === "status"
+    && flags.workflow === true
+    && loaded !== null
+    && !validClassification(loaded)
+    && isRecord(loaded.previousWorkflow);
+  const state = !historicalStatus && newerWorkflow(related, loaded)
     ? inheritedState(sessionId, cwd, related, currentFingerprint)
     : loaded ?? inheritedState(sessionId, cwd, related, currentFingerprint);
 
@@ -314,25 +319,10 @@ export function runController(argv, options = {}) {
     }
     if (state !== loaded || flags.agent !== undefined) saveState(dataDir, state);
     if (flags.workflow === true) {
-      const workflowId = state.workflowId ?? state.promptHash;
-      const worktrees = loadSessionStates(dataDir, sessionId)
-        .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId && sameRepository(entry.cwd, cwd))
-        .map((entry) => ({
-          cwd: entry.cwd,
-          agentIds: entry.agentIds ?? [],
-          active: entry.active,
-          changed: entry.changed,
-          pending: pendingReasons(entry, fingerprint(entry.cwd)),
-        }));
-      return success(JSON.stringify({
-        workflowId,
-        tier: state.tier,
-        tdd: state.tdd,
-        reviewMode: state.reviewMode,
-        plan: state.plan,
-        readySteps: readyPlanSteps(state.plan),
-        worktrees,
-      }, null, 2));
+      const workflow = validClassification(state)
+        ? workflowStatus(dataDir, sessionId, cwd, state, fingerprint)
+        : state.previousWorkflow ?? workflowStatus(dataDir, sessionId, cwd, state, fingerprint);
+      return success(JSON.stringify(workflow, null, 2));
     }
     return success(JSON.stringify(state, null, 2));
   }
@@ -489,6 +479,15 @@ function onUserPromptLocked(input, context) {
   const state = continuing
     ? previous
     : freshState(input.session_id, input.cwd, previous, current);
+  if (!continuing && previous !== null && validClassification(previous)) {
+    state.previousWorkflow = workflowStatus(
+      context.dataDir,
+      input.session_id,
+      input.cwd,
+      previous,
+      context.fingerprint,
+    );
+  }
   const previousPromptHash = state.promptHash;
   const previousWorkflowId = state.workflowId;
   if (continuing && typeof state.workflowId !== "string") state.workflowId = randomUUID();
@@ -537,14 +536,25 @@ function onPreToolUse(input, context) {
   const workspace = hookWorkspace(input, context);
   if (workspace.error !== null) return deny(`VoltFlow blocked the tool: ${workspace.error}`);
   if (workspace.unmanaged === true) return null;
+  const routedAgent = typeof input.agent_id === "string" && !sameWorkspace(workspace.cwd, input.cwd);
   const state = withStateLock(context.dataDir, input.session_id, () => {
     const existing = loadState(context.dataDir, input.session_id, workspace.cwd);
     const related = relatedState(context.dataDir, input.session_id, workspace.cwd);
-    if (existing !== null && !newerWorkflow(related, existing)) return existing;
-    if (related === null) return null;
-    const inherited = inheritedState(input.session_id, workspace.cwd, related, context.fingerprint(workspace.cwd));
-    saveState(context.dataDir, inherited);
-    return inherited;
+    const bindAgent = routedAgent && !loadSessionStates(context.dataDir, input.session_id)
+      .some((entry) => entry.agentIds?.includes(input.agent_id));
+    const current = existing !== null && !newerWorkflow(related, existing)
+      ? existing
+      : related === null
+        ? null
+        : inheritedState(input.session_id, workspace.cwd, related, context.fingerprint(workspace.cwd));
+    if (current !== null && bindAgent) {
+      current.agentIds ??= [];
+      if (!current.agentIds.includes(input.agent_id)) current.agentIds.push(input.agent_id);
+    }
+    if (current !== null && (current !== existing || bindAgent)) {
+      saveState(context.dataDir, current);
+    }
+    return current;
   });
   if (state === null && loadSessionStates(context.dataDir, input.session_id).length > 0) {
     return deny("VoltFlow blocked the tool: this session has no workflow state for that Git repository.");
@@ -814,6 +824,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     reworkCycles: 0,
     valueWarningIssued: false,
     agentIds: [],
+    previousWorkflow: previous?.previousWorkflow ?? null,
     baselineFingerprint: currentFingerprint,
     baselineApproval: previous?.approval?.fingerprint === currentFingerprint ? previous.approval : null,
     lastFingerprint: currentFingerprint,
@@ -854,6 +865,27 @@ function pendingReasons(state, currentFingerprint) {
   if (state.validation?.fingerprint !== currentFingerprint) reasons.push("fresh validation missing");
   if (state.approval?.fingerprint !== currentFingerprint) reasons.push("final review missing or stale");
   return reasons;
+}
+
+function workflowStatus(dataDir, sessionId, cwd, state, fingerprint) {
+  const workflowId = state.workflowId ?? state.promptHash;
+  return {
+    workflowId,
+    tier: state.tier,
+    tdd: state.tdd,
+    reviewMode: state.reviewMode,
+    plan: state.plan,
+    readySteps: readyPlanSteps(state.plan),
+    worktrees: loadSessionStates(dataDir, sessionId)
+      .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId && sameRepository(entry.cwd, cwd))
+      .map((entry) => ({
+        cwd: entry.cwd,
+        agentIds: entry.agentIds ?? [],
+        active: entry.active,
+        changed: entry.changed,
+        pending: pendingReasons(entry, fingerprint(entry.cwd)),
+      })),
+  };
 }
 
 function evidenceBlocker(state, currentFingerprint) {
@@ -1195,9 +1227,10 @@ function isTestCommand(command, response) {
   const segment = segments[0].trim();
   if (TEST_COMMAND.test(segment)) return true;
   const [wrapper, ...rest] = segment.split(/\s+/);
+  const wrapped = wrapper === "rtk" && rest[0] === "proxy" ? rest.slice(1) : rest;
   return rest.length > 0
     && !NON_EXECUTING_COMMANDS.test(wrapper)
-    && TEST_COMMAND.test(rest.join(" "))
+    && TEST_COMMAND.test(wrapped.join(" "))
     && TEST_OUTPUT.test(toolResponseText(response));
 }
 

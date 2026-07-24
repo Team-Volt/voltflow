@@ -174,6 +174,24 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
+test("a report-only follow-up keeps the completed workflow visible", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Update the parser" }), fx.options);
+  start(fx);
+  const completedId = loadState(fx.dataDir, "session-1").workflowId;
+  handleHook(input("Stop", { last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", { prompt: "Review how well VoltFlow worked" }), fx.options);
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: "/repo" },
+  );
+
+  assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
+  assert.equal(JSON.parse(status.stdout).workflowId, completedId);
+  assert.equal(JSON.parse(status.stdout).tier, "standard");
+});
+
 test("slash command disables all VoltFlow hooks for the session", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Update the parser" }), fx.options);
@@ -404,6 +422,48 @@ test("workflow status shows ready plan steps and linked agent bindings", () => {
   assert.equal(workflow.worktrees.length, 2);
   assert.deepEqual(workflow.worktrees.find((entry) => entry.cwd === realpathSync(fx.worker)).agentIds, ["worker-1"]);
   assert.ok(workflow.worktrees.every((entry) => Array.isArray(entry.pending)));
+});
+
+test("a worker binds to its worktree on first routed tool use", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    agent_id: "worker-1",
+    tool_name: "exec_command",
+    tool_input: { cmd: "rg TODO" },
+  }), fx.options);
+  assert.deepEqual(loadState(fx.dataDir, "session-1", fx.root).agentIds, []);
+
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    agent_id: "worker-1",
+    tool_name: "exec_command",
+    tool_input: { cmd: "rg TODO", workdir: fx.worker },
+  }), fx.options);
+
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: fx.root },
+  );
+  const workflow = JSON.parse(status.stdout);
+  assert.deepEqual(
+    workflow.worktrees.find((entry) => entry.cwd === realpathSync(fx.worker)).agentIds,
+    ["worker-1"],
+  );
+
+  handleHook(input("PreToolUse", {
+    cwd: fx.worker,
+    agent_id: "worker-1",
+    tool_name: "exec_command",
+    tool_input: { cmd: "rg TODO", workdir: fx.root },
+  }), fx.options);
+  assert.deepEqual(loadState(fx.dataDir, "session-1", fx.root).agentIds, []);
 });
 
 test("adaptive plans are stored in protected state and revised in place", () => {
@@ -1020,6 +1080,36 @@ test("a continuation does not adopt worker state from an older workflow", () => 
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tdd, "required");
 });
 
+test("linked report status does not inherit a stale peer workflow", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "README.md") },
+  }), fx.options);
+  const completedId = loadState(fx.dataDir, "session-1", fx.worker).workflowId;
+  handleHook(input("Stop", { cwd: fx.root, last_assistant_message: "Done" }), fx.options);
+  handleHook(input("Stop", { cwd: fx.worker, last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", {
+    cwd: fx.worker,
+    prompt: "Review how well VoltFlow worked",
+  }), fx.options);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tier, "unclassified");
+
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: fx.worker },
+  );
+  assert.equal(JSON.parse(status.stdout).workflowId, completedId);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tier, "unclassified");
+});
+
 test("repeated prompt text starts a new worktree workflow generation", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Apply changes" }), fx.options);
@@ -1546,6 +1636,20 @@ test("transparent wrappers and dotted unittest selectors record RED without pois
   const state = loadState(fx.dataDir, "session-1");
   assert.equal(state.tddViolation, false);
   assert.match(state.red.details, /python3 -m unittest/);
+});
+
+test("rtk proxy test failures record RED", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "exec_command",
+    tool_input: { cmd: "rtk proxy node --test test/parser.test.mjs" },
+    tool_response: { exit_code: 1, output: "TAP version 13\nnot ok 1 - rejects invalid input" },
+  }), fx.options);
+
+  assert.match(loadState(fx.dataDir, "session-1").red.details, /rtk proxy node --test/);
 });
 
 test("direct Python unittest files record RED with interpreter flags", () => {

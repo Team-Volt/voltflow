@@ -44,4 +44,4 @@ Review prompts name the supported boundary, materiality threshold, and stop rule
 
 Do not spawn an agent when the main agent's next action depends immediately on its result, when the assignment is smaller than the handoff, or when two workers would touch the same file.
 
-After spawning, continue independent parent work. When none remains, use one bounded wait instead of repeated short polls; after two unchanged waits, send one scope-reducing follow-up, then interrupt only when the agent is blocking completion and has exceeded its stated stop condition.
+After spawning, continue independent parent work. When none remains, use bounded waits instead of short polls. An unchanged wait is not evidence that work has stalled, so keep waiting while the agent remains within its stated stop condition and reports no blocker. Send a follow-up only when the agent asks for help, reports an error, or exceeds that stop condition; reduce scope only when the original outcome is no longer achievable, never merely to end a long-running task. Interrupt only when the agent is blocking completion and a follow-up did not recover it.
