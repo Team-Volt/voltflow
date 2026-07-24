@@ -749,6 +749,7 @@ test("validated worker evidence can be adopted before an integration merge", () 
   writeFileSync(path.join(fx.worker, "README.md"), "worker change\n");
   git(fx.worker, "add", "README.md");
   git(fx.worker, "commit", "-qm", "worker change");
+  git(fx.worker, "branch", "-m", "codex/voltflow-live-smoke");
   assert.equal(runController(
     ["validate", "--session", "session-1", "--evidence", "worker tests passed"],
     { ...fx.options, cwd: fx.worker },
@@ -759,7 +760,7 @@ test("validated worker evidence can be adopted before an integration merge", () 
     { ...fx.options, cwd: fx.root },
   );
   assert.equal(adopted.exitCode, 0, adopted.stderr);
-  git(fx.root, "merge", "--no-ff", "worker", "-m", "merge worker");
+  git(fx.root, "merge", "--no-ff", "codex/voltflow-live-smoke", "-m", "merge worker");
   handleHook(input("PostToolUse", {
     cwd: fx.root,
     tool_name: "Bash",
@@ -791,6 +792,47 @@ test("an unapproved integration merge still requires RED", () => {
     tool_name: "Bash",
     tool_input: {
       command: "rtk git merge --no-ff codex/voltflow-live-smoke -m 'test: integrate live VoltFlow worker smoke'",
+    },
+    tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).tddViolation, true);
+});
+
+test("integrated RED evidence cannot approve a different worker merge", () => {
+  const fx = worktreeFixture();
+  const unrelated = mkdtempSync(path.join(tmpdir(), "voltflow-unrelated-"));
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["red", "--session", "session-1", "--evidence", "focused worker regression failed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  writeFileSync(path.join(fx.worker, "README.md"), "validated worker change\n");
+  git(fx.worker, "add", "README.md");
+  git(fx.worker, "commit", "-qm", "validated worker change");
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "worker tests passed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+
+  git(fx.root, "worktree", "add", "-qb", "codex/unrelated-live-smoke", unrelated);
+  writeFileSync(path.join(unrelated, "UNRELATED.md"), "unrelated\n");
+  git(unrelated, "add", "UNRELATED.md");
+  git(unrelated, "commit", "-qm", "unrelated change");
+  assert.equal(runController(
+    ["integrate", "--session", "session-1", "--from", fx.worker],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  git(fx.root, "merge", "--no-ff", "codex/unrelated-live-smoke", "-m", "merge unrelated");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "Bash",
+    tool_input: {
+      command: "rtk git merge --no-ff codex/unrelated-live-smoke -m 'test: integrate unrelated worker smoke'",
     },
     tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
   }), fx.options);

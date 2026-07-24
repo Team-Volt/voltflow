@@ -234,9 +234,15 @@ export function runController(argv, options = {}) {
     const sourceFingerprint = fingerprint(source.cwd);
     const blocker = evidenceBlocker(source, sourceFingerprint);
     if (blocker !== null) return failure(`integration source is not ready: ${blocker}`);
+    const sourceHead = git(source.cwd, ["rev-parse", "HEAD"]);
+    const targetHead = git(cwd, ["rev-parse", "HEAD"]);
+    if (!sourceHead.ok || !targetHead.ok) return failure("integration Git heads are unavailable");
     state.red = {
       ...evidence(`validated worker evidence from ${source.cwd}`, currentFingerprint),
-      source: "integration",
+      integration: {
+        sourceHead: sourceHead.stdout.trim(),
+        targetHead: targetHead.stdout.trim(),
+      },
     };
     state.redObserved = state.red;
     state.updatedAt = timestamp();
@@ -668,7 +674,7 @@ function onPostToolUseLocked(input, context) {
       && state.tddViolation !== true
       && touchesTest
       && touchesProduction
-      && !(state.red.source === "integration" && command !== null && isGitMergeCommand(command))
+      && !(command !== null && isGitMergeCommand(command) && matchesIntegratedMerge(state.red, workspace.cwd))
     ) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
@@ -1272,6 +1278,18 @@ function isGitMergeCommand(command) {
   const unquoted = command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "quoted");
   return shellSegments(unquoted).every((segment) =>
     /^(?:rtk\s+)?git\s+(?:(?:-[Cc]\s+\S+|--(?:git-dir|work-tree)(?:=\S+|\s+\S+))\s+)*merge\b/i.test(segment));
+}
+
+function matchesIntegratedMerge(red, cwd) {
+  if (!isRecord(red?.integration)
+    || typeof red.integration.sourceHead !== "string"
+    || typeof red.integration.targetHead !== "string") return false;
+  const result = git(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"]);
+  if (!result.ok) return false;
+  const [, ...parents] = result.stdout.trim().split(/\s+/);
+  return parents.length === 2
+    && parents[0] === red.integration.targetHead
+    && parents[1] === red.integration.sourceHead;
 }
 
 function isDryRunSegment(segment) {
