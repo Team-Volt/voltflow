@@ -8,9 +8,9 @@ Inspect the active spawn schema before delegating. Treat its model descriptions 
 | --- | --- | --- |
 | Mechanical, read-heavy, repetitive, or easy to verify | Fastest capable model | Low or medium |
 | Bounded implementation with clear acceptance checks | Balanced coding model | Medium or high |
-| Ambiguous planning, difficult debugging, or cross-cutting integration | Strongest suitable model | High, xhigh, or max |
+| Ambiguous planning, difficult debugging, or cross-cutting integration | Strongest suitable model | High or xhigh |
 | Adversarial or holistic review | Capable reviewer, preferably configured differently from the author | Scale with ambiguity and the strength of deterministic checks |
-| Named high-risk boundary where a miss is expensive | Strongest suitable model | High, xhigh, or max |
+| Named high-risk boundary where a miss is expensive | Strongest suitable model | High or xhigh; max only under rule 5 |
 
 ## Routing rules
 
@@ -18,11 +18,12 @@ Inspect the active spawn schema before delegating. Treat its model descriptions 
 2. The main session owns the selection. Set `model` and `reasoning_effort` directly when the spawn schema exposes them, and omit `service_tier` unless the user requests one.
 3. For independent review, prefer a model or reasoning configuration different from the author when available. Raise capability or effort only when the review scope, uncertainty, or named risk justifies it.
 4. Named high-risk boundaries include authorization, private data, payments, bookings, destructive or data-integrity migrations, and cross-cutting architecture. They establish a higher selection floor without prescribing one model family.
-5. Never select `ultra` reasoning for a subagent. If the user explicitly requests it, report the policy conflict instead of substituting another effort.
-6. Honor any other explicit user selection. If the requested model or effort is unavailable, report that instead of silently substituting or downgrading it.
-7. If only `agent_type` is available, select the closest matching profile whose effort is known and not `ultra`. If no override surface exists, inherit the parent only when its effort is known and not `ultra`; state `routing degraded` once in the result. If neither compliant route exists, refuse the spawn and state `routing blocked`.
-8. Record the selected model, reasoning effort, and short task-based rationale in the assignment or result so routing decisions remain reviewable.
-9. Size each wave to the useful independent slices and the host's available concurrency. Do not create slices solely to increase agent count.
+5. Reserve `max` reasoning for security work, destructive or data-integrity risk, and genuinely deep cross-cutting architecture with high ambiguity. A `high` tier or adversarial review does not justify `max` by itself; ordinary high-tier implementation and review top out at `xhigh`.
+6. Never select `ultra` reasoning for a subagent. If the user explicitly requests it, report the policy conflict instead of substituting another effort.
+7. Honor any other explicit user selection. If the requested model or effort is unavailable, report that instead of silently substituting or downgrading it.
+8. If only `agent_type` is available, select the closest matching profile whose effort is known and not `ultra`. If no override surface exists, inherit the parent only when its effort is known and not `ultra`; state `routing degraded` once in the result. If neither compliant route exists, refuse the spawn and state `routing blocked`.
+9. Record the selected model, reasoning effort, and short task-based rationale in the assignment or result so routing decisions remain reviewable.
+10. Size each wave to the useful independent slices and the host's available concurrency. Do not create slices solely to increase agent count.
 
 ## Spawn schema
 
@@ -43,4 +44,4 @@ Review prompts name the supported boundary, materiality threshold, and stop rule
 
 Do not spawn an agent when the main agent's next action depends immediately on its result, when the assignment is smaller than the handoff, or when two workers would touch the same file.
 
-After spawning, continue independent parent work. When none remains, use one bounded wait instead of repeated short polls; after two unchanged waits, send one scope-reducing follow-up, then interrupt only when the agent is blocking completion and has exceeded its stated stop condition.
+After spawning, continue independent parent work. When none remains, use bounded waits instead of short polls. An unchanged wait is not evidence that work has stalled, so keep waiting while the agent remains within its stated stop condition and reports no blocker. Send a follow-up only when the agent asks for help, reports an error, or exceeds that stop condition; reduce scope only when the original outcome is no longer achievable, never merely to end a long-running task. Interrupt only when the agent is blocking completion and a follow-up did not recover it.

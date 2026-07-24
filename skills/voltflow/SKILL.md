@@ -23,6 +23,42 @@ Classify TDD as `required` for observable behavior and `exempt` for prose, gener
 
 Start the controller with `review=self` for trivial, `review=single` for standard, and `review=split` for high. Upgrade when discovery reveals more risk; do not downgrade to avoid a gate.
 
+## Build and revise the adaptive plan
+
+After starting standard or high work, store a plan with the controller's `plan --spec <JSON>` command. The parent agent owns this workflow-wide record:
+
+```json
+{
+  "goal": "Ship the requested behavior",
+  "steps": [
+    {
+      "id": "implement",
+      "action": "Add the behavior",
+      "dependsOn": [],
+      "lane": "code",
+      "stop": "The focused test passes",
+      "status": "pending"
+    },
+    {
+      "id": "review",
+      "action": "Review and fix material findings",
+      "dependsOn": ["implement"],
+      "lane": "review",
+      "stop": "Review passes",
+      "repeat": { "max": 2, "attempt": 0, "until": "Review passes" }
+    }
+  ]
+}
+```
+
+Steps with satisfied dependencies can run in parallel. `lane` groups related work; it does not cap concurrency. Size each wave to the useful independent slices and the host's capacity, using the existing routing rules without adding a separate cost policy.
+
+Revise the plan only when evidence changes the work. Use `plan --step <JSON>` for a single step; it patches an existing step or adds a complete new one, validates the whole plan, increments the revision, and updates linked worktrees. Use `plan --spec <JSON>` only when the goal or several steps change together. A failed test adds or activates the smallest fix step. A review failure advances a bounded fix, validate, review repeat. Mark a step `done` with concise `evidence` when its stop condition holds, and end a repeat early when its `until` condition holds. Never exceed `repeat.max`; stop and report the blocker instead.
+
+The plan coordinates work but does not execute commands or grant approval. It cannot bypass RED, validation, independent review, or the deployment gate, and it never needs a user approval key.
+
+Run `status --workflow` before staffing a wave or when a worker's lifecycle is unclear. It reports ready step IDs and each linked worktree's agent bindings and missing evidence.
+
 ## Execute required TDD one behavior at a time
 
 When TDD is required, turn the acceptance criteria into ordered behavior slices before production code. Each slice is one observable behavior that one focused test can prove. Do not batch several tests before implementation or implement behavior reserved for a later slice.

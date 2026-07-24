@@ -167,7 +167,29 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /9-second cap/i);
   assert.match(output.hookSpecificOutput.additionalContext, /at most ten/i);
   assert.match(output.hookSpecificOutput.additionalContext, /same assignment/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /standard or high.*after start succeeds.*plan.*--spec/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /evidence changes/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /plan.*--step.*single step/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /status.*--workflow.*ready steps.*worktrees/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
+});
+
+test("a report-only follow-up keeps the completed workflow visible", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Update the parser" }), fx.options);
+  start(fx);
+  const completedId = loadState(fx.dataDir, "session-1").workflowId;
+  handleHook(input("Stop", { last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", { prompt: "Review how well VoltFlow worked" }), fx.options);
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: "/repo" },
+  );
+
+  assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
+  assert.equal(JSON.parse(status.stdout).workflowId, completedId);
+  assert.equal(JSON.parse(status.stdout).tier, "standard");
 });
 
 test("slash command disables all VoltFlow hooks for the session", () => {
@@ -364,6 +386,234 @@ test("status persists an inherited worktree baseline", () => {
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).cwd, realpathSync(fx.worker));
 });
 
+test("workflow status shows ready plan steps and linked agent bindings", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Ship parallel work",
+      steps: [
+        { id: "code", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes", status: "active" },
+        { id: "docs", action: "Document it", dependsOn: [], lane: "docs", stop: "Docs match behavior" },
+        { id: "shipped", action: "Already done", dependsOn: [], lane: "code", stop: "Done", status: "done", evidence: "Shipped" },
+        { id: "paused", action: "Cannot proceed", dependsOn: [], lane: "code", stop: "Blocked", status: "blocked", evidence: "Waiting on access" },
+        { id: "review", action: "Review it", dependsOn: ["code", "docs"], lane: "review", stop: "Review passes" },
+      ],
+    })],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["status", "--session", "session-1", "--agent", "worker-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: fx.root },
+  );
+  assert.equal(status.exitCode, 0, status.stderr);
+  const workflow = JSON.parse(status.stdout);
+  assert.deepEqual(workflow.readySteps, ["docs"]);
+  assert.equal(workflow.plan.goal, "Ship parallel work");
+  assert.equal(workflow.worktrees.length, 2);
+  assert.deepEqual(workflow.worktrees.find((entry) => entry.cwd === realpathSync(fx.worker)).agentIds, ["worker-1"]);
+  assert.ok(workflow.worktrees.every((entry) => Array.isArray(entry.pending)));
+});
+
+test("a worker binds to its worktree on first routed tool use", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    agent_id: "worker-1",
+    tool_name: "exec_command",
+    tool_input: { cmd: "rg TODO" },
+  }), fx.options);
+  assert.deepEqual(loadState(fx.dataDir, "session-1", fx.root).agentIds, []);
+
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    agent_id: "worker-1",
+    tool_name: "exec_command",
+    tool_input: { cmd: "rg TODO", workdir: fx.worker },
+  }), fx.options);
+
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: fx.root },
+  );
+  const workflow = JSON.parse(status.stdout);
+  assert.deepEqual(
+    workflow.worktrees.find((entry) => entry.cwd === realpathSync(fx.worker)).agentIds,
+    ["worker-1"],
+  );
+
+  handleHook(input("PreToolUse", {
+    cwd: fx.worker,
+    agent_id: "worker-1",
+    tool_name: "exec_command",
+    tool_input: { cmd: "rg TODO", workdir: fx.root },
+  }), fx.options);
+  assert.deepEqual(loadState(fx.dataDir, "session-1", fx.root).agentIds, []);
+});
+
+test("adaptive plans are stored in protected state and revised in place", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement the parser" }), fx.options);
+  start(fx);
+  const spec = {
+    goal: "Ship the parser",
+    steps: [
+      { id: "build", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes" },
+      {
+        id: "review",
+        action: "Review it",
+        dependsOn: ["build"],
+        lane: "review",
+        stop: "No material blockers remain",
+        repeat: { max: 2, until: "Review passes" },
+      },
+    ],
+  };
+
+  const first = runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(first.exitCode, 0, first.stderr);
+  const stored = loadState(fx.dataDir, "session-1").plan;
+  assert.deepEqual({ ...stored, updatedAt: undefined }, { ...spec, revision: 1, updatedAt: undefined });
+  assert.equal(typeof stored.updatedAt, "string");
+
+  spec.steps[0].stop = "Focused and regression tests pass";
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 2);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.steps[0].stop, "Focused and regression tests pass");
+
+  for (const invalid of [
+    { goal: "No bound", steps: [{ id: "loop", action: "Retry", dependsOn: [], lane: "code", stop: "Done", repeat: { until: "Done" } }] },
+    { goal: "Unsupported completion", steps: [
+      { id: "done", action: "Finish", dependsOn: [], lane: "code", stop: "Done", status: "done" },
+    ] },
+    { goal: "Unsupported retry", steps: [
+      {
+        id: "retry",
+        action: "Retry",
+        dependsOn: [],
+        lane: "code",
+        stop: "Done",
+        repeat: { max: 2, attempt: 1, until: "Done" },
+      },
+    ] },
+    { goal: "Cycle", steps: [
+      { id: "a", action: "A", dependsOn: ["b"], lane: "code", stop: "Done" },
+      { id: "b", action: "B", dependsOn: ["a"], lane: "code", stop: "Done" },
+    ] },
+  ]) {
+    assert.equal(runController(
+      ["plan", "--session", "session-1", "--spec", JSON.stringify(invalid)],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode, 1);
+  }
+});
+
+test("adaptive plans can revise one step without reposting the full plan", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement the parser" }), fx.options);
+  start(fx);
+  const spec = {
+    goal: "Ship the parser",
+    steps: [
+      { id: "build", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes" },
+      { id: "review", action: "Review it", dependsOn: ["build"], lane: "review", stop: "Review passes" },
+    ],
+  };
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+
+  const premature = runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({
+      id: "review",
+      status: "done",
+      evidence: "Review passed",
+    })],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(premature.exitCode, 1);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 1);
+
+  const revised = runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({
+      id: "build",
+      status: "done",
+      evidence: "Focused test passed",
+    })],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(revised.exitCode, 0, revised.stderr);
+  assert.deepEqual(loadState(fx.dataDir, "session-1").plan.steps, [
+    { ...spec.steps[0], status: "done", evidence: "Focused test passed" },
+    spec.steps[1],
+  ]);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 2);
+
+  const invalid = runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({ id: "review", status: "done" })],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(invalid.exitCode, 1);
+  assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 2);
+});
+
+test("adaptive plan revisions propagate across linked worktrees", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const spec = {
+    goal: "Ship parallel work",
+    steps: [
+      { id: "code", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes" },
+      { id: "docs", action: "Document it", dependsOn: [], lane: "docs", stop: "Docs match behavior" },
+    ],
+  };
+
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["status", "--session", "session-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.deepEqual(loadState(fx.dataDir, "session-1", fx.worker).plan.steps, spec.steps);
+
+  spec.steps[0].status = "done";
+  spec.steps[0].evidence = "Focused test passed";
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).plan.revision, 2);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).plan.steps[0].status, "done");
+});
+
 test("restarting a parent workflow reactivates an already-bound worker", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
@@ -499,6 +749,7 @@ test("validated worker evidence can be adopted before an integration merge", () 
   writeFileSync(path.join(fx.worker, "README.md"), "worker change\n");
   git(fx.worker, "add", "README.md");
   git(fx.worker, "commit", "-qm", "worker change");
+  git(fx.worker, "branch", "-m", "codex/voltflow-live-smoke");
   assert.equal(runController(
     ["validate", "--session", "session-1", "--evidence", "worker tests passed"],
     { ...fx.options, cwd: fx.worker },
@@ -509,11 +760,13 @@ test("validated worker evidence can be adopted before an integration merge", () 
     { ...fx.options, cwd: fx.root },
   );
   assert.equal(adopted.exitCode, 0, adopted.stderr);
-  git(fx.root, "merge", "--no-ff", "worker", "-m", "merge worker");
+  git(fx.root, "merge", "--no-ff", "codex/voltflow-live-smoke", "-m", "merge worker");
   handleHook(input("PostToolUse", {
     cwd: fx.root,
     tool_name: "Bash",
-    tool_input: { command: "git merge --no-ff worker" },
+    tool_input: {
+      command: "rtk git merge --no-ff codex/voltflow-live-smoke -m 'test: integrate live VoltFlow worker smoke'",
+    },
     tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
   }), fx.options);
 
@@ -521,6 +774,70 @@ test("validated worker evidence can be adopted before an integration merge", () 
   assert.equal(state.tddViolation, false);
   assert.match(state.redObserved.details, /validated worker/i);
   assert.equal(state.validation, null);
+});
+
+test("an unapproved integration merge still requires RED", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  writeFileSync(path.join(fx.worker, "README.md"), "worker change\n");
+  git(fx.worker, "add", "README.md");
+  git(fx.worker, "commit", "-qm", "worker change");
+  git(fx.root, "merge", "--no-ff", "worker", "-m", "merge worker");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "Bash",
+    tool_input: {
+      command: "rtk git merge --no-ff codex/voltflow-live-smoke -m 'test: integrate live VoltFlow worker smoke'",
+    },
+    tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).tddViolation, true);
+});
+
+test("integrated RED evidence cannot approve a different worker merge", () => {
+  const fx = worktreeFixture();
+  const unrelated = mkdtempSync(path.join(tmpdir(), "voltflow-unrelated-"));
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["red", "--session", "session-1", "--evidence", "focused worker regression failed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  writeFileSync(path.join(fx.worker, "README.md"), "validated worker change\n");
+  git(fx.worker, "add", "README.md");
+  git(fx.worker, "commit", "-qm", "validated worker change");
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "worker tests passed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+
+  git(fx.root, "worktree", "add", "-qb", "codex/unrelated-live-smoke", unrelated);
+  writeFileSync(path.join(unrelated, "UNRELATED.md"), "unrelated\n");
+  git(unrelated, "add", "UNRELATED.md");
+  git(unrelated, "commit", "-qm", "unrelated change");
+  assert.equal(runController(
+    ["integrate", "--session", "session-1", "--from", fx.worker],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  git(fx.root, "merge", "--no-ff", "codex/unrelated-live-smoke", "-m", "merge unrelated");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "Bash",
+    tool_input: {
+      command: "rtk git merge --no-ff codex/unrelated-live-smoke -m 'test: integrate unrelated worker smoke'",
+    },
+    tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).tddViolation, true);
 });
 
 test("integration rejects stale worker validation", () => {
@@ -828,6 +1145,36 @@ test("a continuation does not adopt worker state from an older workflow", () => 
   assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
   assert.match(result.hookSpecificOutput.permissionDecisionReason, /failing test|reproduction/i);
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tdd, "required");
+});
+
+test("linked report status does not inherit a stale peer workflow", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "README.md") },
+  }), fx.options);
+  const completedId = loadState(fx.dataDir, "session-1", fx.worker).workflowId;
+  handleHook(input("Stop", { cwd: fx.root, last_assistant_message: "Done" }), fx.options);
+  handleHook(input("Stop", { cwd: fx.worker, last_assistant_message: "Done" }), fx.options);
+
+  handleHook(input("UserPromptSubmit", {
+    cwd: fx.worker,
+    prompt: "Review how well VoltFlow worked",
+  }), fx.options);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tier, "unclassified");
+
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: fx.worker },
+  );
+  assert.equal(JSON.parse(status.stdout).workflowId, completedId);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).tier, "unclassified");
 });
 
 test("repeated prompt text starts a new worktree workflow generation", () => {
@@ -1169,7 +1516,7 @@ test("an unfinished workflow reactivates when the user says continue", () => {
 test("controller help lists the workflow commands", () => {
   const result = runController(["--help"]);
   assert.equal(result.exitCode, 0);
-  assert.match(result.stdout, /start\|skip\|red\|validate\|integrate\|review\|approve\|status\|gate/);
+  assert.match(result.stdout, /start\|skip\|red\|validate\|integrate\|plan\|review\|approve\|status\|gate/);
 });
 
 function productionPatchDecision(fx) {
@@ -1356,6 +1703,20 @@ test("transparent wrappers and dotted unittest selectors record RED without pois
   const state = loadState(fx.dataDir, "session-1");
   assert.equal(state.tddViolation, false);
   assert.match(state.red.details, /python3 -m unittest/);
+});
+
+test("rtk proxy test failures record RED", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "exec_command",
+    tool_input: { cmd: "rtk proxy node --test test/parser.test.mjs" },
+    tool_response: { exit_code: 1, output: "TAP version 13\nnot ok 1 - rejects invalid input" },
+  }), fx.options);
+
+  assert.match(loadState(fx.dataDir, "session-1").red.details, /rtk proxy node --test/);
 });
 
 test("direct Python unittest files record RED with interpreter flags", () => {
