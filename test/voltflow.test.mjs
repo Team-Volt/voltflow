@@ -763,7 +763,9 @@ test("validated worker evidence can be adopted before an integration merge", () 
   handleHook(input("PostToolUse", {
     cwd: fx.root,
     tool_name: "Bash",
-    tool_input: { command: "git merge --no-ff worker" },
+    tool_input: {
+      command: "rtk git merge --no-ff codex/voltflow-live-smoke -m 'test: integrate live VoltFlow worker smoke'",
+    },
     tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
   }), fx.options);
 
@@ -771,6 +773,29 @@ test("validated worker evidence can be adopted before an integration merge", () 
   assert.equal(state.tddViolation, false);
   assert.match(state.redObserved.details, /validated worker/i);
   assert.equal(state.validation, null);
+});
+
+test("an unapproved integration merge still requires RED", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  writeFileSync(path.join(fx.worker, "README.md"), "worker change\n");
+  git(fx.worker, "add", "README.md");
+  git(fx.worker, "commit", "-qm", "worker change");
+  git(fx.root, "merge", "--no-ff", "worker", "-m", "merge worker");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "Bash",
+    tool_input: {
+      command: "rtk git merge --no-ff codex/voltflow-live-smoke -m 'test: integrate live VoltFlow worker smoke'",
+    },
+    tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).tddViolation, true);
 });
 
 test("integration rejects stale worker validation", () => {

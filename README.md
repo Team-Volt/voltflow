@@ -187,6 +187,15 @@ codex plugin add voltflow@team-volt
 
 Start a new Codex task, run `/hooks`, inspect the VoltFlow hook commands, and trust them. Codex loads newly installed skills and hooks when a new task starts.
 
+To update VoltFlow, refresh the marketplace snapshot and reinstall the plugin:
+
+```sh
+codex plugin marketplace upgrade team-volt
+codex plugin add voltflow@team-volt
+```
+
+Restart Codex after the update so new tasks load the current hooks and skill.
+
 VoltFlow stores session state under protected `PLUGIN_DATA`; it does not add workflow ledgers to the target repository. If a sandboxed controller command cannot reach that directory, rerun the exact command with external permission. Do not copy approval state into the worktree or a temporary directory.
 
 ## Use it

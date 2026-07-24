@@ -234,7 +234,10 @@ export function runController(argv, options = {}) {
     const sourceFingerprint = fingerprint(source.cwd);
     const blocker = evidenceBlocker(source, sourceFingerprint);
     if (blocker !== null) return failure(`integration source is not ready: ${blocker}`);
-    state.red = evidence(`validated worker evidence from ${source.cwd}`, currentFingerprint);
+    state.red = {
+      ...evidence(`validated worker evidence from ${source.cwd}`, currentFingerprint),
+      source: "integration",
+    };
     state.redObserved = state.red;
     state.updatedAt = timestamp();
     saveState(dataDir, state);
@@ -659,7 +662,14 @@ function onPostToolUseLocked(input, context) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
     }
-    if (state.tdd === "required" && state.red !== null && state.tddViolation !== true && touchesTest && touchesProduction) {
+    if (
+      state.tdd === "required"
+      && state.red !== null
+      && state.tddViolation !== true
+      && touchesTest
+      && touchesProduction
+      && !(state.red.source === "integration" && command !== null && isGitMergeCommand(command))
+    ) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
     }
@@ -1256,6 +1266,12 @@ function isGitMetadataCommand(command) {
   const unquoted = command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "quoted");
   return shellSegments(unquoted).every((segment) =>
     /^(?:rtk\s+)?git\s+(?:(?:-[Cc]\s+\S+|--(?:git-dir|work-tree)(?:=\S+|\s+\S+))\s+)*(?:add|commit|diff)\b/i.test(segment));
+}
+
+function isGitMergeCommand(command) {
+  const unquoted = command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "quoted");
+  return shellSegments(unquoted).every((segment) =>
+    /^(?:rtk\s+)?git\s+(?:(?:-[Cc]\s+\S+|--(?:git-dir|work-tree)(?:=\S+|\s+\S+))\s+)*merge\b/i.test(segment));
 }
 
 function isDryRunSegment(segment) {
