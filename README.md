@@ -23,56 +23,29 @@ VoltFlow addresses those problems without forcing the same process onto every ta
 
 ```mermaid
 flowchart TB
-    REQUEST(["Change requested"])
-    FULL{"Full workflow needed?"}
-    SKIP["Record why this prompt can skip"]
-    SKIP_DONE(["Finish without deployment approval"])
-    CLASSIFY["1. Classify scope, risk, TDD, and review"]
-    PLAN["2. Record an inline intent or adaptive plan"]
-    WORKERS{"Independent work is useful?"}
-    BUILD["3. Agent executes each bounded step"]
-    DELEGATE["3. Route workers into isolated worktrees"]
-    WORK["Agent and workers execute their assigned steps"]
-    INTEGRATE["4. Adopt current worker evidence"]
-    MERGE["Agent merges the worker result"]
-    VALIDATE["5. Validate the complete current fingerprint"]
-    REVIEW["6. Run the required review and route reviewers when needed"]
-    BLOCKER{"Material blocker found?"}
-    RETRY{"Configured review repeat remains?"}
-    FIX["Fix the shared cause and validate again"]
-    STOP["Stop and report the unresolved blocker"]
-    DELIVERY{"Deployment requested?"}
-    FINISH(["Finish with current evidence"])
-    GATE["7. Check approval against the current fingerprint"]
-    PASS{"Gate passes?"}
-    OVERRIDE{"User explicitly authorizes a one-shot override?"}
-    DEPLOY["Deploy or release"]
-    BLOCKED["Block deployment and report missing evidence"]
-    DONE(["Finish"])
-    CONTRACT["Agent performs engineering work; VoltFlow records and checks evidence"]
+    REQUEST(["Request"]) --> SCOPE{"Use full workflow?"}
+    SCOPE -->|"No"| SKIP(["Continue without VoltFlow"])
+    SCOPE -->|"Yes"| PLAN["Plan dependencies, outcomes, and repeat limits"]
 
-    REQUEST --> FULL
-    FULL -->|No| SKIP --> SKIP_DONE
-    FULL -->|Yes| CLASSIFY --> PLAN --> WORKERS
-    WORKERS -->|No| BUILD --> VALIDATE
-    WORKERS -->|Yes| DELEGATE --> WORK --> INTEGRATE --> MERGE --> VALIDATE
-    VALIDATE --> REVIEW --> BLOCKER
-    BLOCKER -->|Yes| RETRY
-    RETRY -->|Yes| FIX --> VALIDATE
-    RETRY -->|No| STOP
-    BLOCKER -->|No| DELIVERY
-    DELIVERY -->|No| FINISH
-    DELIVERY -->|Yes| GATE --> PASS
-    PASS -->|Yes| DEPLOY --> DONE
-    PASS -->|No| OVERRIDE
-    OVERRIDE -->|Yes| DEPLOY
-    OVERRIDE -->|No| BLOCKED
-    CONTRACT -.-> CLASSIFY
-    CONTRACT -.-> BUILD
-    CONTRACT -.-> VALIDATE
+    PLAN --> READY["Select ready steps"]
+    READY --> RUN["Run step"]
+    RUN --> RECORD["Record result atomically"]
+    RECORD --> REFRESH["Refresh workflow readiness"]
+
+    REFRESH -->|"Step ready"| RUN
+    REFRESH -->|"Waiting on dependencies"| WAIT(["Waiting"])
+    REFRESH -->|"Step's repeat limit reached"| BLOCKED(["Blocked"])
+    REFRESH -->|"Plan complete"| VERIFY["Validate and review"]
+
+    VERIFY -->|"Fix required"| READY
+    VERIFY -->|"Pass"| DELIVERY{"Deploy requested?"}
+    DELIVERY -->|"No"| DONE(["Done"])
+    DELIVERY -->|"Yes"| GATE{"Delivery gate passes?"}
+    GATE -->|"Yes"| DEPLOY(["Deploy"])
+    GATE -->|"No"| BLOCKED
 ```
 
-The diagram shows the full path. "Agent executes each bounded step" means RED to GREEN slices when TDD is required, or the closest useful check when TDD is exempt. Trivial work may use a short inline intent instead of a stored plan. Prose-only or similarly low-risk work can skip the workflow entirely when there is no deployment intent.
+The diagram shows workflow state and leaves worker and Git mechanics out. Repeat limits apply to individual steps, not the whole workflow. Each non-matching result increments the step's attempt count; the step blocks when that count reaches `repeat.max`.
 
 ### 1. Classify the work
 
