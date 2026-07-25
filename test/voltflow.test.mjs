@@ -167,6 +167,10 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /9-second cap/i);
   assert.match(output.hookSpecificOutput.additionalContext, /at most ten/i);
   assert.match(output.hookSpecificOutput.additionalContext, /same assignment/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /higher reasoning effort.*take longer/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /elapsed time.*unchanged wait.*stall/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /follow up.*error.*exceeds.*stop condition/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /interrupt.*blocking completion.*follow-up.*did not recover/i);
   assert.match(output.hookSpecificOutput.additionalContext, /standard or high.*after start succeeds.*plan.*--spec/i);
   assert.match(output.hookSpecificOutput.additionalContext, /evidence changes/i);
   assert.match(output.hookSpecificOutput.additionalContext, /plan.*--step.*single step/i);

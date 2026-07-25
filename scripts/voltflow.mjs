@@ -530,6 +530,7 @@ function onUserPromptLocked(input, context) {
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
       `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
       `When a subagent spawn or status reports "Selected model is at capacity", wait 3, 6, and 9 seconds for the first three retries, then use a 9-second cap, for at most ten replacement spawns; preserve the same assignment, model, reasoning, scope, and evidence contract, and stop after the first success or a different error. ` +
+      `Higher reasoning efforts can take longer. Do not treat elapsed time or an unchanged wait as a stall. Follow up only when the worker asks for help, reports an error, or exceeds its stop condition. Interrupt only when the worker is blocking completion and a follow-up did not recover it. ` +
       `Completion bar: finish when current evidence shows the result is safe and satisfies the requested scope. Theoretical edge cases are advisory unless they are reproducible in ordinary documented use and break requested behavior, a repository invariant, or a material safety boundary. Do not reopen validated work for speculative improvement.${configNote}`,
   );
 }
