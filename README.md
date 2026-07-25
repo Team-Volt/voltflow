@@ -23,29 +23,21 @@ VoltFlow addresses those problems without forcing the same process onto every ta
 
 ```mermaid
 flowchart TB
-    REQUEST(["Request"]) --> SCOPE{"Use full workflow?"}
-    SCOPE -->|"No"| SKIP(["Continue without VoltFlow"])
-    SCOPE -->|"Yes"| PLAN["Plan dependencies, outcomes, and repeat limits"]
+    WORK["Plan and run ready work"] --> RESULT{"Record result; refresh readiness"}
+    RESULT -->|"Ready or retry"| WORK
+    RESULT -->|"Waiting"| WAIT(["Waiting"])
+    RESULT -->|"Repeat exhausted"| BLOCKED(["Blocked"])
+    RESULT -->|"Plan complete"| VERIFY["Validate and review"]
 
-    PLAN --> READY["Select ready steps"]
-    READY --> RUN["Run step"]
-    RUN --> RECORD["Record result atomically"]
-    RECORD --> REFRESH["Refresh workflow readiness"]
-
-    REFRESH -->|"Step ready"| RUN
-    REFRESH -->|"Waiting on dependencies"| WAIT(["Waiting"])
-    REFRESH -->|"Step's repeat limit reached"| BLOCKED(["Blocked"])
-    REFRESH -->|"Plan complete"| VERIFY["Validate and review"]
-
-    VERIFY -->|"Fix required"| READY
-    VERIFY -->|"Pass"| DELIVERY{"Deploy requested?"}
-    DELIVERY -->|"No"| DONE(["Done"])
-    DELIVERY -->|"Yes"| GATE{"Delivery gate passes?"}
-    GATE -->|"Yes"| DEPLOY(["Deploy"])
-    GATE -->|"No"| GATE_BLOCKED(["Blocked"])
+    VERIFY -->|"Fix needed"| WORK
+    VERIFY -->|"Pass"| DELIVERY{"Delivery"}
+    DELIVERY -->|"Not requested"| DONE(["Done"])
+    DELIVERY -->|"Current review or override"| DEPLOY(["Deploy"])
+    DELIVERY -->|"Review missing or stale"| VERIFY
+    DELIVERY -->|"Git fingerprint unavailable"| GATE_BLOCKED(["Blocked"])
 ```
 
-The diagram shows workflow state and leaves worker and Git mechanics out. Repeat limits apply to individual steps, not the whole workflow. Each non-matching result increments the step's attempt count; the step blocks when that count reaches `repeat.max`.
+The diagram starts after a task enters the full workflow and leaves worker and Git mechanics out. VoltFlow records each result atomically, then refreshes which steps are ready, waiting, complete, or repeat-exhausted. Repeat limits apply to individual steps.
 
 ### 1. Classify the work
 
