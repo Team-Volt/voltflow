@@ -42,7 +42,7 @@ flowchart TB
     DELIVERY -->|"No"| DONE(["Done"])
     DELIVERY -->|"Yes"| GATE{"Delivery gate passes?"}
     GATE -->|"Yes"| DEPLOY(["Deploy"])
-    GATE -->|"No"| BLOCKED
+    GATE -->|"No"| GATE_BLOCKED(["Blocked"])
 ```
 
 The diagram shows workflow state and leaves worker and Git mechanics out. Repeat limits apply to individual steps, not the whole workflow. Each non-matching result increments the step's attempt count; the step blocks when that count reaches `repeat.max`.
