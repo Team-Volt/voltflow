@@ -171,6 +171,7 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /elapsed time.*unchanged wait.*stall/i);
   assert.match(output.hookSpecificOutput.additionalContext, /follow up.*error.*exceeds.*stop condition/i);
   assert.match(output.hookSpecificOutput.additionalContext, /interrupt.*blocking completion.*follow-up.*did not recover/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /create.*linked worktree.*before.*parallel writer/i);
   assert.match(output.hookSpecificOutput.additionalContext, /standard or high.*after start succeeds.*plan.*--spec/i);
   assert.match(output.hookSpecificOutput.additionalContext, /evidence changes/i);
   assert.match(output.hookSpecificOutput.additionalContext, /plan.*--step.*single step/i);
@@ -321,6 +322,7 @@ test("subagent contract limits per-slice TDD to required work", () => {
   assert.match(context, /first user-visible update.*selected model, reasoning effort, and a one-sentence reason/i);
   assert.match(context, /before any tool call or other commentary/i);
   assert.match(context, /copy.*route sentence.*verbatim.*EVIDENCE/i);
+  assert.match(context, /assigned worktree.*before.*writer edit/i);
 });
 
 test("active v2 spawns require isolated context", () => {
@@ -1488,6 +1490,86 @@ test("review receipts route to their assigned worktree state", () => {
   assert.equal(loadState(fx.dataDir, "session-1", fx.root).reviewPasses.length, 0);
 });
 
+test("a connector deployment uses the only reviewed linked worktree", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Build and deploy the site" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "standard", "--tdd", "exempt", "--review", "single"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  writeFileSync(path.join(fx.worker, "README.md"), "reviewed worker\n");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "README.md") },
+    tool_response: "Success",
+  }), fx.options);
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "exec_command",
+    tool_input: { cmd: "node --test", workdir: fx.worker },
+    tool_response: { exit_code: 0, output: "TAP version 13\nok 1 - site" },
+  }), fx.options);
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "site checks passed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: fx.worker },
+  );
+  assert.equal(assigned.exitCode, 0, assigned.stderr);
+  const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
+  assert.ok(token);
+  handleHook(input("SubagentStop", {
+    cwd: fx.root,
+    agent_id: "site-reviewer",
+    last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${token}`,
+  }), fx.options);
+
+  assert.equal(handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "mcp__codex_apps__sites__deploy_private_site_version",
+    tool_input: { site_id: "site-1", version_id: "version-1" },
+  }), fx.options), null);
+  assert.equal(handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "Bash",
+    tool_input: { command: "npm run deploy" },
+  }), fx.options).hookSpecificOutput.permissionDecision, "deny");
+
+  const secondWorker = mkdtempSync(path.join(tmpdir(), "voltflow-worker-"));
+  git(fx.root, "worktree", "add", "-qb", "worker-2", secondWorker);
+  writeFileSync(path.join(secondWorker, "README.md"), "second reviewed worker\n");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(secondWorker, "README.md") },
+    tool_response: "Success",
+  }), fx.options);
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "second site checks passed"],
+    { ...fx.options, cwd: secondWorker },
+  ).exitCode, 0);
+  const secondAssigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: secondWorker },
+  );
+  const secondToken = /token=(\S+)/.exec(secondAssigned.stdout)?.[1];
+  assert.ok(secondToken);
+  handleHook(input("SubagentStop", {
+    cwd: fx.root,
+    agent_id: "second-site-reviewer",
+    last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${secondToken}`,
+  }), fx.options);
+
+  assert.equal(handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "mcp__codex_apps__sites__deploy_private_site_version",
+    tool_input: { site_id: "site-1", version_id: "version-1" },
+  }), fx.options).hookSpecificOutput.permissionDecision, "deny");
+});
+
 test("a live review receipt can retry after generated artifacts are removed", async () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Review parallel work" }), fx.options);
@@ -1864,6 +1946,7 @@ test("reverting a pre-RED production edit clears the violation", () => {
     { ...fx.options, fingerprint: () => "diff-b" },
   );
   assert.equal(loadState(fx.dataDir, "session-1").tddViolation, true);
+  assert.equal(productionPatchDecision(fx), null);
 
   handleHook(
     input("PostToolUse", {
@@ -1951,6 +2034,28 @@ test("an unfinished workflow reactivates when the user says continue", () => {
   const output = handleHook(input("UserPromptSubmit", { prompt: "continue" }), fx.options);
   assert.match(output.hookSpecificOutput.additionalContext, /VoltFlow is active/);
   assert.equal(loadState(fx.dataDir, "session-1").changed, true);
+});
+
+test("an explicit start on a new prompt replaces the prior workflow", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Remove obsolete docs" }), fx.options);
+  start(fx, { tier: "trivial", tdd: "exempt", review: "self" });
+  recordProductionEdit(fx);
+  passedTest(fx);
+  assert.equal(runController(
+    ["approve", "--self", "--session", "session-1", "--evidence", "docs checked"],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+  fx.setFingerprint("other-branch");
+  handleHook(input("UserPromptSubmit", { prompt: "Fix the workflow engine" }), fx.options);
+
+  const restarted = runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: "/repo" },
+  );
+
+  assert.equal(restarted.exitCode, 0, restarted.stderr);
+  assert.equal(loadState(fx.dataDir, "session-1").tdd, "required");
 });
 
 test("controller help lists the workflow commands", () => {

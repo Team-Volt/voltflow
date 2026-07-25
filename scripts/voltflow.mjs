@@ -546,8 +546,8 @@ function onUserPromptLocked(input, context) {
     return userContext("VoltFlow deployment override armed for one matching deployment on the current diff.");
   }
 
-  const unfinished = previous?.changed === true && previous.approval?.fingerprint !== current;
-  const continuing = previous?.active === true || unfinished;
+  const unfinished = previous?.changed === true && previous.approval === null;
+  const continuing = previous?.active === true && previous.approval === null || unfinished;
   const state = continuing
     ? previous
     : freshState(input.session_id, input.cwd, previous, current);
@@ -592,6 +592,7 @@ function onUserPromptLocked(input, context) {
       `Use ${prefix.replace("<command>", "plan")} --step <JSON> to update a single step, ${prefix.replace("<command>", "plan")} --result <JSON> to record a declared outcome, and ${prefix.replace("<command>", "status")} --workflow to see ready steps, waiting reasons, and linked worktrees. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
       `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
+      `Create a distinct linked worktree before spawning each parallel writer, include its absolute path in the assignment, and require the writer's first controller status command to run there. ` +
       `When a subagent spawn or status reports "Selected model is at capacity", wait 3, 6, and 9 seconds for the first three retries, then use a 9-second cap, for at most ten replacement spawns; preserve the same assignment, model, reasoning, scope, and evidence contract, and stop after the first success or a different error. ` +
       `Higher reasoning efforts can take longer. Do not treat elapsed time or an unchanged wait as a stall. Follow up only when the worker asks for help, reports an error, or exceeds its stop condition. Interrupt only when the worker is blocking completion and a follow-up did not recover it. ` +
       `Completion bar: finish when current evidence shows the result is safe and satisfies the requested scope. Theoretical edge cases are advisory unless they are reproducible in ordinary documented use and break requested behavior, a repository invariant, or a material safety boundary. Do not reopen validated work for speculative improvement.${configNote}`,
@@ -648,16 +649,30 @@ function onPreToolUse(input, context) {
 
   if (isDeployInvocation(input.tool_name, input.tool_input, workspace.cwd)) {
     if (state === null) return deny("VoltFlow blocked deployment: no workflow state or review receipt exists.");
-    const current = context.fingerprint(workspace.cwd);
-    const gate = gateStatus(state, current);
+    let gateState = state;
+    let gateCwd = workspace.cwd;
+    let current = context.fingerprint(gateCwd);
+    let gate = gateStatus(gateState, current);
+    if (!gate.allowed && !isCommandTool(input.tool_name) && workdirsFrom(input.tool_input).length === 0) {
+      const workflowId = state.workflowId ?? state.promptHash;
+      const reviewed = relatedStates(context.dataDir, input.session_id, workspace.cwd).filter((candidate) =>
+        (candidate.workflowId ?? candidate.promptHash) === workflowId
+        && gateStatus(candidate, context.fingerprint(candidate.cwd)).source === "review receipt");
+      if (reviewed.length === 1) {
+        [gateState] = reviewed;
+        gateCwd = gateState.cwd;
+        current = context.fingerprint(gateCwd);
+        gate = gateStatus(gateState, current);
+      }
+    }
     if (!gate.allowed) return deny(`VoltFlow blocked deployment: ${gate.reason}`);
     if (gate.source === "user override") {
       return withStateLock(context.dataDir, input.session_id, () => {
-        const fresh = loadState(context.dataDir, input.session_id, workspace.cwd);
+        const fresh = loadState(context.dataDir, input.session_id, gateCwd);
         if (fresh === null) {
           return deny("VoltFlow blocked deployment: workflow state changed before the override could be consumed.");
         }
-        const freshGate = gateStatus(fresh, context.fingerprint(workspace.cwd));
+        const freshGate = gateStatus(fresh, context.fingerprint(gateCwd));
         if (freshGate.source !== "user override") {
           return deny(`VoltFlow blocked deployment: ${freshGate.reason ?? "the one-shot override was already consumed"}.`);
         }
@@ -678,7 +693,12 @@ function onPreToolUse(input, context) {
   if (state.tdd === "required" && paths.some(isTestPath) && paths.some((file) => !isTestPath(file))) {
     return deny("VoltFlow requires test and production edits to be separate. Update the test, rerun RED, then edit production.");
   }
-  if (state.tdd === "required" && state.red === null && paths.some((file) => !isTestPath(file))) {
+  if (
+    state.tdd === "required"
+    && state.red === null
+    && state.tddViolation !== true
+    && paths.some((file) => !isTestPath(file))
+  ) {
     return deny("VoltFlow requires a failing test or reproduction before production edits. Add the focused test, run it, and verify the expected failure.");
   }
   return null;
@@ -775,7 +795,7 @@ function onSubagentStart(input, context) {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        `VoltFlow subtask contract: Before any tool call or other commentary, your first user-visible update must copy the ROUTE sentence verbatim from the assignment's EVIDENCE field; it states the selected model, reasoning effort, and a one-sentence reason. ${prefix === null ? "" : `Run ${prefix} from the assigned worktree; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
+        `VoltFlow subtask contract: Before any tool call or other commentary, your first user-visible update must copy the ROUTE sentence verbatim from the assignment's EVIDENCE field; it states the selected model, reasoning effort, and a one-sentence reason. ${prefix === null ? "" : `Run ${prefix} from the assigned worktree before any writer edit; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
     },
   };
 }

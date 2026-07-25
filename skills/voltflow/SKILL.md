@@ -91,7 +91,7 @@ Record successful automated or manual validation with the controller. A passing 
 
 ## Delegate only useful parallel work
 
-Read [references/routing.md](references/routing.md) before spawning. Scale concurrent subagents to the number of useful independent slices and the host's available capacity. Parallel writers need disjoint owned paths; serialize shared files and dependencies.
+Read [references/routing.md](references/routing.md) before spawning. Scale concurrent subagents to the number of useful independent slices and the host's available capacity. Parallel writers need disjoint owned paths and distinct linked worktrees created before spawn; serialize shared files and dependencies. Include the absolute worktree path in each writer's assignment.
 
 The `SubagentStart` hook supplies the exact controller prefix, including protected data, session, and agent arguments. Run its `status` command from the assigned worktree before other commands; this binds host events that report the parent cwd to the worker state. Assigned paths may be new unless the assignment explicitly requires existing files.
 
