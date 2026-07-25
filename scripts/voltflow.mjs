@@ -1247,7 +1247,7 @@ function isTestCommand(command, response) {
   return rest.length > 0
     && !NON_EXECUTING_COMMANDS.test(wrapper)
     && TEST_COMMAND.test(wrapped.join(" "))
-    && TEST_OUTPUT.test(toolResponseText(response));
+    && (wrapper === "rtk" && rest[0] !== "proxy" || TEST_OUTPUT.test(toolResponseText(response)));
 }
 
 function toolResponseText(response) {
