@@ -756,9 +756,15 @@ function onPostToolUseLocked(input, context) {
       state.tdd === "required"
       && state.red !== null
       && state.tddViolation !== true
-      && touchesTest
-      && touchesProduction
-      && !(command !== null && isGitMergeCommand(command) && matchesIntegratedMerge(state.red, workspace.cwd))
+      && (
+        command !== null
+          && isGitMergeCommand(command)
+          && isRecord(state.red.integration)
+          && !matchesIntegratedMerge(state.red, workspace.cwd)
+        || touchesTest
+          && touchesProduction
+          && !(command !== null && isGitMergeCommand(command) && matchesIntegratedMerge(state.red, workspace.cwd))
+      )
     ) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;

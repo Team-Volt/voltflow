@@ -1274,7 +1274,7 @@ test("integrated RED evidence cannot approve a different worker merge", () => {
     cwd: fx.root,
     tool_name: "Bash",
     tool_input: {
-      command: "rtk git merge --no-ff codex/unrelated-live-smoke -m 'test: integrate unrelated worker smoke'",
+      command: "rtk git merge --no-ff codex/unrelated-live-smoke -m 'merge unrelated'",
     },
     tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
   }), fx.options);
