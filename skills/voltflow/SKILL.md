@@ -53,11 +53,25 @@ After starting standard or high work, store a plan with the controller's `plan -
 
 Steps with satisfied dependencies can run in parallel. `lane` groups related work; it does not cap concurrency. Size each wave to the useful independent slices and the host's capacity, using the existing routing rules without adding a separate cost policy.
 
-Revise the plan only when evidence changes the work. Use `plan --step <JSON>` for a single step; it patches an existing step or adds a complete new one, validates the whole plan, increments the revision, and updates linked worktrees. Use `plan --spec <JSON>` only when the goal or several steps change together. A failed test adds or activates the smallest fix step. A review failure advances a bounded fix, validate, review repeat. Mark a step `done` with concise `evidence` when its stop condition holds, and end a repeat early when its `until` condition holds. Never exceed `repeat.max`; stop and report the blocker instead.
+Use named outcomes when later work depends on how a step finished:
+
+```json
+{
+  "id": "review",
+  "dependsOn": ["implement"],
+  "when": { "step": "implement", "outcome": "changed" },
+  "outcomes": ["retry", "pass"],
+  "repeat": { "max": 2, "attempt": 0, "untilOutcome": "pass" }
+}
+```
+
+Record a declared outcome with `plan --result '{"id":"review","outcome":"pass","evidence":"Review passed"}'`. A normal result completes the step. A non-matching repeat result increments its attempt and makes it ready again, or blocks it at `repeat.max`.
+
+Revise the plan only when evidence changes the work. Use `plan --step <JSON>` for a single step; it patches an existing step or adds a complete new one, validates the whole plan, increments the revision, and updates linked worktrees. Result state belongs to the controller and cannot be changed through `plan --step`. Use `plan --spec <JSON>` only when the goal or several steps change together. A failed test adds or activates the smallest fix step. Older plans without named outcomes keep their current behavior.
 
 The plan coordinates work but does not execute commands or grant approval. It cannot bypass RED, validation, independent review, or the deployment gate, and it never needs a user approval key.
 
-Run `status --workflow` before staffing a wave or when a worker's lifecycle is unclear. It reports ready step IDs and each linked worktree's agent bindings and missing evidence.
+Run `status --workflow` before staffing a wave or when a worker's lifecycle is unclear. It reports ready step IDs, waiting steps with a short reason, and each linked worktree's agent bindings and missing evidence.
 
 ## Execute required TDD one behavior at a time
 

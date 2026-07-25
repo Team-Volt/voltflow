@@ -95,11 +95,25 @@ A simple, low-risk task with no executable behavior or deployment intent can use
 
 ### 2. Plan in proportion to risk
 
-Standard and high workflows store an adaptive plan in protected session state. A plan can describe dependencies, parallel lanes, stop conditions, and capped repeats. `status --workflow` reports which steps are ready and shows linked worktrees with their agent bindings and missing evidence.
+Standard and high workflows store an adaptive plan in protected session state. A plan can describe dependencies, parallel lanes, stop conditions, named outcomes, conditional branches, and capped repeats. `status --workflow` reports ready steps, waiting steps, and linked worktrees with their agent bindings and missing evidence.
 
 The plan is coordination data. It does not run commands, create worktrees, approve a review, or bypass any gate. The agent performs those actions.
 
 Plans change only when the evidence changes the work. The agent can update one step with `plan --step` instead of rewriting the whole plan.
+
+Conditional steps use exact outcome names:
+
+```json
+{
+  "id": "fix",
+  "dependsOn": ["review"],
+  "when": { "step": "review", "outcome": "changes-requested" },
+  "outcomes": ["retry", "fixed"],
+  "repeat": { "max": 3, "attempt": 0, "untilOutcome": "fixed" }
+}
+```
+
+The agent records a result with `plan --result '{"id":"review","outcome":"changes-requested","evidence":"Reviewer found a regression"}'`. VoltFlow stores the result under the session lock, updates linked worktrees to the same plan revision, and makes only the matching branch ready. Invalid results leave the plan unchanged. Plans without these conditional fields work as before.
 
 ### 3. Build one behavior at a time
 
@@ -229,8 +243,8 @@ The agent normally receives complete controller commands from the prompt hook. T
 | `start` | Set the tier, TDD mode, and review mode |
 | `skip` | Record why a simple prompt does not need the full workflow |
 | `red` | Record a manual failing test or reproduction |
-| `plan` | Create an adaptive plan or update one step |
-| `status` | Show state, ready plan steps, worktrees, and missing evidence |
+| `plan` | Create a plan, update one step, or record a declared outcome |
+| `status` | Show state, ready and waiting plan steps, worktrees, and missing evidence |
 | `validate` | Record validation for the current fingerprint |
 | `integrate` | Adopt validated evidence from a linked worker worktree |
 | `review` | Create a fingerprint-bound independent review assignment |

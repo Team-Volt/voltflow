@@ -62,7 +62,7 @@ const USAGE = [
   "skip: --evidence <reason> (simple work only, before any change)",
   "red|validate: --evidence <text>",
   "integrate: --from <validated worker worktree>",
-  "plan: --spec <JSON> | --step <JSON>",
+  "plan: --spec <JSON> | --step <JSON> | --result <JSON>",
   "status: [--agent <id>] [--workflow]",
   "review: --lane composite|correctness-security|validation-scope",
   "approve: --self --evidence <text>",
@@ -254,11 +254,40 @@ export function runController(argv, options = {}) {
     if (!["standard", "high"].includes(state.tier) || state.active !== true) {
       return failure("adaptive plans require an active standard or high workflow");
     }
+    if ([flags.spec, flags.step, flags.result].filter((value) => value !== undefined).length !== 1) {
+      return failure("plan requires exactly one of --spec, --step, or --result");
+    }
     let spec = parsePlanSpec(flags.spec);
+    if (flags.spec !== undefined && spec !== null && state.plan !== null) {
+      const existingSteps = new Map(state.plan.steps.map((step) => [step.id, step]));
+      spec = {
+        ...spec,
+        steps: spec.steps.map((step) => {
+          const existing = existingSteps.get(step.id);
+          if (existing?.result === undefined) return step;
+          return {
+            ...step,
+            status: existing.status,
+            evidence: existing.evidence,
+            result: existing.result,
+            ...(existing.repeat?.untilOutcome !== undefined && step.repeat !== undefined
+              ? { repeat: { ...step.repeat, attempt: existing.repeat.attempt ?? 0 } }
+              : {}),
+          };
+        }),
+      };
+    }
     if (flags.step !== undefined) {
       const patch = parsePlanStep(flags.step);
       const existing = state.plan?.steps.find((step) => step.id === patch?.id);
-      if (patch === null || state.plan === null) {
+      if (
+        patch === null
+        || state.plan === null
+        || Object.hasOwn(patch, "result")
+        || existing?.repeat?.untilOutcome !== undefined
+          && isRecord(patch.repeat)
+          && Object.hasOwn(patch.repeat, "attempt")
+      ) {
         return failure("plan --step requires valid JSON and an existing plan");
       }
       const step = {
@@ -275,6 +304,40 @@ export function runController(argv, options = {}) {
           : state.plan.steps.map((candidate) => candidate.id === step.id ? step : candidate),
       };
       if (!validPlan(spec, false)) return failure("plan --step would make the plan invalid");
+    }
+    if (flags.result !== undefined) {
+      const result = parsePlanResult(flags.result);
+      const existing = state.plan?.steps.find((step) => step.id === result?.id);
+      if (result === null || state.plan === null || existing === undefined) {
+        return failure("plan --result requires valid JSON and an existing step");
+      }
+      const statuses = new Map(state.plan.steps.map((step) => [step.id, step.status]));
+      const source = existing.when === undefined
+        ? undefined
+        : state.plan.steps.find((step) => step.id === existing.when.step);
+      if (
+        !existing.outcomes?.includes(result.outcome)
+        || ["done", "blocked"].includes(existing.status)
+        || existing.dependsOn.some((id) => statuses.get(id) !== "done")
+        || existing.when !== undefined && source?.result?.outcome !== existing.when.outcome
+      ) {
+        return failure("plan --result is not valid for the current step state");
+      }
+      const attempt = (existing.repeat?.attempt ?? 0) + 1;
+      const repeats = existing.repeat?.untilOutcome !== undefined;
+      const complete = !repeats || result.outcome === existing.repeat.untilOutcome;
+      const step = {
+        ...existing,
+        status: complete ? "done" : attempt >= existing.repeat.max ? "blocked" : "pending",
+        evidence: result.evidence,
+        result: { outcome: result.outcome, evidence: result.evidence, at: timestamp() },
+        ...(repeats ? { repeat: { ...existing.repeat, attempt: complete ? existing.repeat.attempt ?? 0 : attempt } } : {}),
+      };
+      spec = {
+        goal: state.plan.goal,
+        steps: state.plan.steps.map((candidate) => candidate.id === step.id ? step : candidate),
+      };
+      if (!validPlan(spec, false)) return failure("plan --result would make the plan invalid");
     }
     if (spec === null) return failure("plan requires a valid bounded --spec JSON value");
     const peers = relatedStates(dataDir, sessionId, cwd).filter((peer) =>
@@ -526,7 +589,7 @@ function onUserPromptLocked(input, context) {
       `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
       `For a simple, low-risk edit with no deployment intent, replace start with skip and add --evidence <reason>; skip must happen before any change and does not approve deployment. ` +
       `For standard or high work, after start succeeds run ${prefix.replace("<command>", "plan")} --spec <JSON> to store the bounded adaptive plan; revise it only when evidence changes the work. ` +
-      `Use ${prefix.replace("<command>", "plan")} --step <JSON> to update a single step, and ${prefix.replace("<command>", "status")} --workflow to see ready steps and linked worktrees. ` +
+      `Use ${prefix.replace("<command>", "plan")} --step <JSON> to update a single step, ${prefix.replace("<command>", "plan")} --result <JSON> to record a declared outcome, and ${prefix.replace("<command>", "status")} --workflow to see ready steps, waiting reasons, and linked worktrees. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
       `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
       `When a subagent spawn or status reports "Selected model is at capacity", wait 3, 6, and 9 seconds for the first three retries, then use a 9-second cap, for at most ten replacement spawns; preserve the same assignment, model, reasoning, scope, and evidence contract, and stop after the first success or a different error. ` +
@@ -885,13 +948,14 @@ function pendingReasons(state, currentFingerprint) {
 
 function workflowStatus(dataDir, sessionId, cwd, state, fingerprint) {
   const workflowId = state.workflowId ?? state.promptHash;
+  const readiness = planReadiness(state.plan);
   return {
     workflowId,
     tier: state.tier,
     tdd: state.tdd,
     reviewMode: state.reviewMode,
     plan: state.plan,
-    readySteps: readyPlanSteps(state.plan),
+    ...readiness,
     worktrees: loadSessionStates(dataDir, sessionId)
       .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId && sameRepository(entry.cwd, cwd))
       .map((entry) => ({
@@ -1050,7 +1114,10 @@ function parsePlanSpec(value) {
   if (typeof value !== "string") return null;
   try {
     const spec = JSON.parse(value);
-    return validPlan(spec, false) ? spec : null;
+    return validPlan(spec, false)
+      && !spec.steps.some((step) => Object.hasOwn(step, "result"))
+      ? spec
+      : null;
   } catch {
     return null;
   }
@@ -1061,6 +1128,21 @@ function parsePlanStep(value) {
   try {
     const step = JSON.parse(value);
     return isRecord(step) && typeof step.id === "string" ? step : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePlanResult(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const result = JSON.parse(value);
+    return isRecord(result)
+      && typeof result.id === "string"
+      && validOutcomeName(result.outcome)
+      && textWithin(result.evidence, 2000)
+      ? result
+      : null;
   } catch {
     return null;
   }
@@ -1078,14 +1160,60 @@ function validPlan(value, stored = true) {
     if (!step.dependsOn.every((id) => typeof id === "string")) return false;
     if (step.status !== undefined && !PLAN_STATUSES.has(step.status)) return false;
     if (step.evidence !== undefined && !textWithin(step.evidence, 2000)) return false;
+    if (step.outcomes !== undefined && (
+      !Array.isArray(step.outcomes)
+      || step.outcomes.length === 0
+      || step.outcomes.length > 16
+      || new Set(step.outcomes).size !== step.outcomes.length
+      || !step.outcomes.every(validOutcomeName)
+    )) return false;
+    if (step.when !== undefined && (
+      !isRecord(step.when)
+      || typeof step.when.step !== "string"
+      || !validOutcomeName(step.when.outcome)
+    )) return false;
     if (step.repeat !== undefined && !validRepeat(step.repeat)) return false;
+    if (step.repeat?.untilOutcome !== undefined && (
+      step.outcomes === undefined
+      || !step.outcomes.includes(step.repeat.untilOutcome)
+    )) return false;
+    if (step.result !== undefined && (
+      !isRecord(step.result)
+      || !step.outcomes?.includes(step.result.outcome)
+      || !textWithin(step.result.evidence, 2000)
+      || typeof step.result.at !== "string"
+      || step.evidence !== step.result.evidence
+    )) return false;
+    if (step.outcomes !== undefined && step.status === "done" && step.result === undefined) return false;
+    if (step.result !== undefined && step.repeat?.untilOutcome === undefined && step.status !== "done") return false;
+    if (step.repeat?.untilOutcome !== undefined) {
+      const attempt = step.repeat.attempt ?? 0;
+      if (attempt > 0 && step.result === undefined) return false;
+      if (step.result?.outcome === step.repeat.untilOutcome && step.status !== "done") return false;
+      if (
+        step.result !== undefined
+        && step.result.outcome !== step.repeat.untilOutcome
+        && step.status !== (attempt >= step.repeat.max ? "blocked" : "pending")
+        && step.status !== "active"
+      ) return false;
+      if (["done", "blocked"].includes(step.status) && step.result === undefined) return false;
+    }
     if ((["done", "blocked"].includes(step.status) || (step.repeat?.attempt ?? 0) > 0) && !textWithin(step.evidence, 2000)) return false;
     ids.add(step.id);
   }
   if (value.steps.some((step) => step.dependsOn.some((id) => !ids.has(id) || id === step.id))) return false;
+  const steps = new Map(value.steps.map((step) => [step.id, step]));
+  if (value.steps.some((step) => step.when !== undefined && (
+    !step.dependsOn.includes(step.when.step)
+    || !steps.get(step.when.step)?.outcomes?.includes(step.when.outcome)
+  ))) return false;
   const statuses = new Map(value.steps.map((step) => [step.id, step.status]));
   if (value.steps.some((step) =>
     ["active", "done"].includes(step.status) && step.dependsOn.some((id) => statuses.get(id) !== "done"))) return false;
+  if (value.steps.some((step) =>
+    ["active", "done"].includes(step.status)
+    && step.when !== undefined
+    && steps.get(step.when.step)?.result?.outcome !== step.when.outcome)) return false;
   return !planHasCycle(value.steps);
 }
 
@@ -1094,16 +1222,44 @@ function validRepeat(value) {
     && Number.isInteger(value.max)
     && value.max >= 1
     && value.max <= 10
-    && textWithin(value.until, 1000)
+    && (textWithin(value.until, 1000) || validOutcomeName(value.untilOutcome))
     && (value.attempt === undefined || Number.isInteger(value.attempt) && value.attempt >= 0 && value.attempt <= value.max);
 }
 
-function readyPlanSteps(plan) {
-  if (plan === null || plan === undefined) return [];
+function validOutcomeName(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+function planReadiness(plan) {
+  if (plan === null || plan === undefined) return { readySteps: [], waitingSteps: [] };
   const done = new Set(plan.steps.filter((step) => step.status === "done").map((step) => step.id));
-  return plan.steps
-    .filter((step) => [undefined, "pending"].includes(step.status) && step.dependsOn.every((id) => done.has(id)))
-    .map((step) => step.id);
+  const steps = new Map(plan.steps.map((step) => [step.id, step]));
+  const readySteps = [];
+  const waitingSteps = [];
+  for (const step of plan.steps) {
+    if (!["pending", undefined].includes(step.status)) {
+      if (step.status === "blocked" && step.repeat?.untilOutcome !== undefined) {
+        waitingSteps.push({ id: step.id, reason: "retry-exhausted" });
+      }
+      continue;
+    }
+    if (!step.dependsOn.every((id) => done.has(id))) {
+      waitingSteps.push({ id: step.id, reason: "dependency" });
+    } else if (
+      step.when !== undefined
+      && steps.get(step.when.step)?.result?.outcome !== step.when.outcome
+    ) {
+      waitingSteps.push({ id: step.id, reason: "outcome" });
+    } else if (
+      step.repeat?.untilOutcome !== undefined
+      && (step.repeat.attempt ?? 0) >= step.repeat.max
+    ) {
+      waitingSteps.push({ id: step.id, reason: "retry-exhausted" });
+    } else {
+      readySteps.push(step.id);
+    }
+  }
+  return { readySteps, waitingSteps };
 }
 
 function planHasCycle(steps) {
