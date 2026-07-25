@@ -113,6 +113,8 @@ Treat examples as examples, not hidden requirements. When instructions conflict,
 
 Before every spawn, tell the user which model and reasoning effort you selected and why in one sentence. Before any tool call or other commentary, the subagent's first user-visible update copies the `ROUTE` sentence verbatim from `EVIDENCE`, so its session stays understandable even when the host hides spawn metadata.
 
+Reasoning effort changes expected runtime. High and xhigh work can take materially longer than low or medium work, so elapsed time and unchanged wait snapshots do not show that a worker has stalled. Keep waiting while it remains inside its stop condition. Follow up only for a request for help, a reported error, or an exceeded stop condition. Interrupt only when the worker is blocking completion and that follow-up did not recover it.
+
 ## Review in proportion to risk
 
 Review the final diff against the request, not against an imagined ideal rewrite. Cover correctness, regression risk, relevant security boundaries, validation quality, and unnecessary scope.

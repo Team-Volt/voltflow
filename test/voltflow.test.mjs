@@ -167,6 +167,10 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /9-second cap/i);
   assert.match(output.hookSpecificOutput.additionalContext, /at most ten/i);
   assert.match(output.hookSpecificOutput.additionalContext, /same assignment/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /higher reasoning effort.*take longer/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /elapsed time.*unchanged wait.*stall/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /follow up.*error.*exceeds.*stop condition/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /interrupt.*blocking completion.*follow-up.*did not recover/i);
   assert.match(output.hookSpecificOutput.additionalContext, /standard or high.*after start succeeds.*plan.*--spec/i);
   assert.match(output.hookSpecificOutput.additionalContext, /evidence changes/i);
   assert.match(output.hookSpecificOutput.additionalContext, /plan.*--step.*single step/i);
@@ -2156,6 +2160,21 @@ test("rtk proxy test failures record RED", () => {
   assert.match(loadState(fx.dataDir, "session-1").red.details, /rtk proxy node --test/);
 });
 
+test("normal rtk test failures record RED and permit production edits", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "exec_command",
+    tool_input: { cmd: "rtk node --test test/parser.test.mjs" },
+    tool_response: { exit_code: 1, output: "Process exited with code 1" },
+  }), fx.options);
+
+  assert.match(loadState(fx.dataDir, "session-1").red.details, /rtk node --test/);
+  assert.equal(productionPatchDecision(fx), null);
+});
+
 test("direct Python unittest files record RED with interpreter flags", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Implement task results" }), fx.options);
@@ -2218,6 +2237,11 @@ test("a wrapper setup failure cannot masquerade as test-runner output", () => {
   handleHook(input("PostToolUse", {
     tool_name: "exec_command",
     tool_input: { cmd: "workspace-tool python3 -m unittest tests.test_graph.StageTests.test_cycle -v" },
+    tool_response: { exit_code: 1, output: "FAIL: workspace unavailable" },
+  }), fx.options);
+  handleHook(input("PostToolUse", {
+    tool_name: "exec_command",
+    tool_input: { cmd: "rtk proxy node --test test/parser.test.mjs" },
     tool_response: { exit_code: 1, output: "FAIL: workspace unavailable" },
   }), fx.options);
 
