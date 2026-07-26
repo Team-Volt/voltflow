@@ -1050,6 +1050,35 @@ test("adaptive plans can revise one step without reposting the full plan", () =>
   assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 2);
 });
 
+test("legacy blocked steps remain editable without repeat metadata", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Revise a legacy blocked plan" }), fx.options);
+  start(fx);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Finish the legacy step",
+      steps: [{
+        id: "legacy",
+        action: "Try the old workflow",
+        dependsOn: [],
+        lane: "code",
+        stop: "Unblock it",
+        status: "blocked",
+        evidence: "Legacy workflow blocked",
+      }],
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({
+      id: "legacy",
+      action: "Try the revised workflow",
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+});
+
 test("adaptive plan revisions propagate across linked worktrees", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);

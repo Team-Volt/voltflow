@@ -1258,7 +1258,8 @@ function validRepeat(value) {
 
 function repeatRevisionStatus(existing, revised) {
   return existing.status === "blocked"
-    && existing.repeat?.untilOutcome === revised.repeat?.untilOutcome
+    && existing.repeat?.untilOutcome !== undefined
+    && existing.repeat.untilOutcome === revised.repeat?.untilOutcome
     && revised.repeat.max > (existing.repeat.attempt ?? 0)
     ? "pending"
     : existing.status;
