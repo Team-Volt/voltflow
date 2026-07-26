@@ -176,6 +176,8 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /evidence changes/i);
   assert.match(output.hookSpecificOutput.additionalContext, /plan.*--step.*single step/i);
   assert.match(output.hookSpecificOutput.additionalContext, /status.*--workflow.*ready steps.*worktrees/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /before reporting.*failure.*run status/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /exact controller state or tool output/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
@@ -323,6 +325,8 @@ test("subagent contract limits per-slice TDD to required work", () => {
   assert.match(context, /before any tool call or other commentary/i);
   assert.match(context, /copy.*route sentence.*verbatim.*EVIDENCE/i);
   assert.match(context, /assigned worktree.*before.*writer edit/i);
+  assert.match(context, /before reporting.*failure.*run.*status/i);
+  assert.match(context, /exact controller state or tool output/i);
 });
 
 test("active v2 spawns require isolated context", () => {
@@ -2442,6 +2446,59 @@ test("a wrapper setup failure cannot masquerade as test-runner output", () => {
   }), fx.options);
 
   assert.equal(loadState(fx.dataDir, "session-1").red, null);
+});
+
+test("a missing production module is setup failure, not RED", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement the dashboard" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "node --test test/ui/app.test.js" },
+    tool_response: {
+      exit_code: 1,
+      output: [
+        "TAP version 13",
+        "Error: Cannot find module '../../public/app'",
+        "code: 'MODULE_NOT_FOUND'",
+        "not ok 1 - test/ui/app.test.js",
+        "code: 'ERR_TEST_FAILURE'",
+      ].join("\n"),
+    },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1").red, null);
+  const decision = handleHook(productionPatch(), fx.options);
+  assert.equal(decision.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(
+    decision.hookSpecificOutput.permissionDecisionReason,
+    /requires a failing test or reproduction/i,
+  );
+});
+
+test("an assertion mentioning MODULE_NOT_FOUND still records RED", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Handle missing modules" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "node --test test/errors.test.js" },
+    tool_response: {
+      exit_code: 1,
+      output: [
+        "TAP version 13",
+        "not ok 1 - maps loader errors",
+        "Expected values to be strictly equal:",
+        "+ actual - expected",
+        "+ 'ERR_OTHER'",
+        "- 'MODULE_NOT_FOUND'",
+      ].join("\n"),
+    },
+  }), fx.options);
+
+  assert.match(loadState(fx.dataDir, "session-1").red.details, /node --test/);
 });
 
 test("review receipts require a fingerprint-bound assignment token", () => {

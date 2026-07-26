@@ -598,6 +598,7 @@ function onUserPromptLocked(input, context) {
       `Create a distinct linked worktree before spawning each parallel writer, include its absolute path in the assignment, and require the writer's first controller status command to run there. ` +
       `When a subagent spawn or status reports "Selected model is at capacity", wait 3, 6, and 9 seconds for the first three retries, then use a 9-second cap, for at most ten replacement spawns; preserve the same assignment, model, reasoning, scope, and evidence contract, and stop after the first success or a different error. ` +
       `Higher reasoning efforts can take longer. Do not treat elapsed time or an unchanged wait as a stall. Follow up only when the worker asks for help, reports an error, or exceeds its stop condition. Interrupt only when the worker is blocking completion and a follow-up did not recover it. ` +
+      `Before reporting a workflow failure or its cause, run status and cite the exact controller state or tool output; label any inference instead of presenting it as observed fact. ` +
       `Completion bar: finish when current evidence shows the result is safe and satisfies the requested scope. Theoretical edge cases are advisory unless they are reproducible in ordinary documented use and break requested behavior, a repository invariant, or a material safety boundary. Do not reopen validated work for speculative improvement.${configNote}`,
   );
 }
@@ -784,7 +785,7 @@ function onPostToolUseLocked(input, context) {
   }
 
   if (testCommand) {
-    if (failed && state.tdd === "required" && state.tddViolation !== true) {
+    if (failed && !testSetupFailed(input.tool_response) && state.tdd === "required" && state.tddViolation !== true) {
       state.red = evidence(command, current);
       state.redObserved = state.red;
     }
@@ -804,7 +805,7 @@ function onSubagentStart(input, context) {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        `VoltFlow subtask contract: Before any tool call or other commentary, your first user-visible update must copy the ROUTE sentence verbatim from the assignment's EVIDENCE field; it states the selected model, reasoning effort, and a one-sentence reason. ${prefix === null ? "" : `Run ${prefix} from the assigned worktree before any writer edit; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
+        `VoltFlow subtask contract: Before any tool call or other commentary, your first user-visible update must copy the ROUTE sentence verbatim from the assignment's EVIDENCE field; it states the selected model, reasoning effort, and a one-sentence reason. ${prefix === null ? "" : `Run ${prefix} from the assigned worktree before any writer edit; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. Before reporting a workflow failure or its cause, run the controller status command and cite the exact controller state or tool output; label any inference instead of presenting it as observed fact. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
     },
   };
 }
@@ -1457,6 +1458,12 @@ function toolResponseText(response) {
 
 function testOutputFailed(response) {
   return /(?:^|\n)(?:not ok \d+\s+-|FAILED \([^\n)]*failures=[1-9]\d*|=+ .* [1-9]\d* failed|test result: FAILED|Tests:\s+.*[1-9]\d* failed|Tests run:.*Failures:\s*[1-9]\d*)/im.test(toolResponseText(response));
+}
+
+function testSetupFailed(response) {
+  return /(?:^|\n)(?:#\s*)?(?:Error(?:\s+\[ERR_MODULE_NOT_FOUND\])?:\s+Cannot find (?:module|package)|ModuleNotFoundError:|ImportError:)/im.test(
+    toolResponseText(response),
+  );
 }
 
 function shellSegments(command) {

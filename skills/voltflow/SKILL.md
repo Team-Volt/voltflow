@@ -145,4 +145,4 @@ Only the user can create an override through a clear natural-language instructio
 
 ## Finish
 
-Stop when the requested behavior works, the final diff is narrow, fresh validation passes, and the required review receipt exists. Report the result and evidence; if evidence is incomplete, the Stop hook preserves that report while leaving deployment blocked instead of forcing Codex to replace the answer.
+Stop when the requested behavior works, the final diff is narrow, fresh validation passes, and the required review receipt exists. Before reporting a workflow failure or its cause, run the controller status command and cite the exact controller state or tool output. Label any inference instead of presenting it as observed fact. Report the result and evidence; if evidence is incomplete, the Stop hook preserves that report while leaving deployment blocked instead of forcing Codex to replace the answer.
