@@ -795,6 +795,29 @@ test("outcome-driven repeats finish early or block at their attempt limit", () =
     { ...exhausted.options, cwd: "/repo" },
   ).exitCode, 1);
   assert.equal(JSON.stringify(loadState(exhausted.dataDir, "session-1").plan), beforeReactivation);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({ id: "D", repeat: { max: 3 } })],
+    { ...exhausted.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.equal(loadState(exhausted.dataDir, "session-1").plan.steps[1].status, "pending");
+  assert.equal(record(exhausted, "Z").exitCode, 0);
+
+  const raisedBySpec = setup();
+  assert.equal(record(raisedBySpec, "retry").exitCode, 0);
+  assert.equal(record(raisedBySpec, "retry").exitCode, 0);
+  const stored = loadState(raisedBySpec.dataDir, "session-1").plan;
+  const raisedSpec = {
+    goal: stored.goal,
+    steps: stored.steps.map(({ status, evidence, result, ...step }) => step.id === "D"
+      ? { ...step, repeat: { max: 3, untilOutcome: "Z" } }
+      : step),
+  };
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(raisedSpec)],
+    { ...raisedBySpec.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.equal(loadState(raisedBySpec.dataDir, "session-1").plan.steps[1].status, "pending");
+  assert.equal(record(raisedBySpec, "Z").exitCode, 0);
 });
 
 test("plan results reject unsafe state changes and preserve legacy readiness", () => {

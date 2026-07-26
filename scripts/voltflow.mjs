@@ -265,15 +265,15 @@ export function runController(argv, options = {}) {
         steps: spec.steps.map((step) => {
           const existing = existingSteps.get(step.id);
           if (existing?.result === undefined) return step;
-          return {
+          const revised = {
             ...step,
-            status: existing.status,
             evidence: existing.evidence,
             result: existing.result,
             ...(existing.repeat?.untilOutcome !== undefined && step.repeat !== undefined
               ? { repeat: { ...step.repeat, attempt: existing.repeat.attempt ?? 0 } }
               : {}),
           };
+          return { ...revised, status: repeatRevisionStatus(existing, revised) };
         }),
       };
     }
@@ -290,13 +290,16 @@ export function runController(argv, options = {}) {
       ) {
         return failure("plan --step requires valid JSON and an existing plan");
       }
-      const step = {
+      let step = {
         ...existing,
         ...patch,
         ...(existing?.repeat !== undefined && patch.repeat !== undefined
           ? { repeat: { ...existing.repeat, ...patch.repeat } }
           : {}),
       };
+      if (existing !== undefined && !Object.hasOwn(patch, "status")) {
+        step = { ...step, status: repeatRevisionStatus(existing, step) };
+      }
       spec = {
         goal: state.plan.goal,
         steps: existing === undefined
@@ -1251,6 +1254,14 @@ function validRepeat(value) {
     && value.max <= 10
     && (textWithin(value.until, 1000) || validOutcomeName(value.untilOutcome))
     && (value.attempt === undefined || Number.isInteger(value.attempt) && value.attempt >= 0 && value.attempt <= value.max);
+}
+
+function repeatRevisionStatus(existing, revised) {
+  return existing.status === "blocked"
+    && existing.repeat?.untilOutcome === revised.repeat?.untilOutcome
+    && revised.repeat.max > (existing.repeat.attempt ?? 0)
+    ? "pending"
+    : existing.status;
 }
 
 function validOutcomeName(value) {
