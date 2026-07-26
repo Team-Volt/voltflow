@@ -789,6 +789,12 @@ test("outcome-driven repeats finish early or block at their attempt limit", () =
     ).stdout).waitingSteps,
     [{ id: "D", reason: "retry-exhausted" }],
   );
+  const beforeReactivation = JSON.stringify(loadState(exhausted.dataDir, "session-1").plan);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({ id: "D", status: "active" })],
+    { ...exhausted.options, cwd: "/repo" },
+  ).exitCode, 1);
+  assert.equal(JSON.stringify(loadState(exhausted.dataDir, "session-1").plan), beforeReactivation);
 });
 
 test("plan results reject unsafe state changes and preserve legacy readiness", () => {
@@ -1216,6 +1222,39 @@ test("validated worker evidence can be adopted before an integration merge", () 
   assert.equal(state.tddViolation, false);
   assert.match(state.redObserved.details, /validated worker/i);
   assert.equal(state.validation, null);
+});
+
+test("validated worker evidence accepts an exact fast-forward merge", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["red", "--session", "session-1", "--evidence", "focused worker regression failed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  writeFileSync(path.join(fx.worker, "README.md"), "worker change\n");
+  git(fx.worker, "add", "README.md");
+  git(fx.worker, "commit", "-qm", "worker change");
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "worker tests passed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["integrate", "--session", "session-1", "--from", fx.worker],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  git(fx.root, "merge", "worker");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "Bash",
+    tool_input: { command: "rtk git merge worker" },
+    tool_response: { exit_code: 0, output: "Fast-forward" },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).tddViolation, false);
 });
 
 test("an unapproved integration merge still requires RED", () => {

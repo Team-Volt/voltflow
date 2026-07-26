@@ -1221,7 +1221,7 @@ function validPlan(value, stored = true) {
         step.result !== undefined
         && step.result.outcome !== step.repeat.untilOutcome
         && step.status !== (attempt >= step.repeat.max ? "blocked" : "pending")
-        && step.status !== "active"
+        && !(step.status === "active" && attempt < step.repeat.max)
       ) return false;
       if (["done", "blocked"].includes(step.status) && step.result === undefined) return false;
     }
@@ -1469,7 +1469,10 @@ function matchesIntegratedMerge(red, cwd) {
     || typeof red.integration.targetHead !== "string") return false;
   const result = git(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"]);
   if (!result.ok) return false;
-  const [, ...parents] = result.stdout.trim().split(/\s+/);
+  const [head, ...parents] = result.stdout.trim().split(/\s+/);
+  if (head === red.integration.sourceHead) {
+    return git(cwd, ["merge-base", "--is-ancestor", red.integration.targetHead, head]).ok;
+  }
   return parents.length === 2
     && parents[0] === red.integration.targetHead
     && parents[1] === red.integration.sourceHead;
