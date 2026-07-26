@@ -2016,6 +2016,37 @@ test("returning to the workflow's starting fingerprint preserves completed evide
   assert.equal(deploy(fx), null);
 });
 
+test("returning to a reviewed fingerprint restores validation and approval", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Update the release" }), fx.options);
+  start(fx, { tdd: "exempt" });
+
+  fx.setFingerprint("reviewed");
+  recordProductionEdit(fx);
+  passedTest(fx);
+  review(fx, "reviewer-1", "composite");
+  assert.equal(deploy(fx), null);
+
+  fx.setFingerprint("temporary");
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "git switch main" },
+    tool_response: { exit_code: 0 },
+  }), fx.options);
+  assert.equal(deploy(fx).hookSpecificOutput.permissionDecision, "deny");
+
+  fx.setFingerprint("reviewed");
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "git pull --ff-only" },
+    tool_response: { exit_code: 0 },
+  }), fx.options);
+
+  assert.equal(deploy(fx), null);
+  assert.equal(loadState(fx.dataDir, "session-1").validation.fingerprint, "reviewed");
+  assert.equal(loadState(fx.dataDir, "session-1").approval.fingerprint, "reviewed");
+});
+
 test("a production write observed before RED cannot be repaired by late evidence", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);

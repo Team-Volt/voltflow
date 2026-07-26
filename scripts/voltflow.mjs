@@ -166,6 +166,7 @@ export function runController(argv, options = {}) {
       reviewPasses: [],
       reviewFailure: null,
       approval: null,
+      evidenceByFingerprint: {},
       override: null,
       skip: null,
       baselineFingerprint: currentFingerprint,
@@ -218,6 +219,7 @@ export function runController(argv, options = {}) {
     if (!textFlag(flags.evidence)) return failure("validate requires --evidence");
     if (currentFingerprint === null) return failure("Git fingerprint unavailable");
     state.validation = evidence(flags.evidence, currentFingerprint);
+    rememberFingerprintEvidence(state);
     saveState(dataDir, state);
     return success("VoltFlow validation recorded");
   }
@@ -380,6 +382,7 @@ export function runController(argv, options = {}) {
     const blocker = evidenceBlocker(state, currentFingerprint);
     if (blocker !== null) return failure(blocker);
     state.approval = approval(currentFingerprint, "self", flags.evidence);
+    rememberFingerprintEvidence(state);
     saveState(dataDir, state);
     return success("VoltFlow self-review approved for the current diff");
   }
@@ -778,9 +781,10 @@ function onPostToolUseLocked(input, context) {
       state.red = null;
     }
     invalidateForChange(state);
+    if (fingerprintChanged) restoreFingerprintEvidence(state, current);
     if (fingerprintChanged && current === state.baselineFingerprint) {
       state.changed = false;
-      state.approval = state.baselineApproval ?? null;
+      state.approval ??= state.baselineApproval ?? null;
     }
   }
 
@@ -789,7 +793,10 @@ function onPostToolUseLocked(input, context) {
       state.red = evidence(command, current);
       state.redObserved = state.red;
     }
-    if (!failed && current !== null) state.validation = evidence(command, current);
+    if (!failed && current !== null) {
+      state.validation = evidence(command, current);
+      rememberFingerprintEvidence(state);
+    }
   }
   if (current !== null) state.lastFingerprint = current;
   state.updatedAt = timestamp();
@@ -839,6 +846,7 @@ function onSubagentStopLocked(input, context) {
     state.reviewPasses = [];
     state.reviewAssignments = [];
     state.approval = null;
+    forgetFingerprintApprovals(state);
     saveState(context.dataDir, state);
     return null;
   }
@@ -859,6 +867,7 @@ function onSubagentStopLocked(input, context) {
     : SPLIT_LANES.size === new Set(state.reviewPasses.filter((entry) => SPLIT_LANES.has(entry.lane)).map((entry) => entry.lane)).size;
   if (approved) {
     state.approval = approval(current, "subagent", state.reviewPasses.map((entry) => entry.lane).join(", "));
+    rememberFingerprintEvidence(state);
     state.reviewFailure = null;
   }
   saveState(context.dataDir, state);
@@ -925,6 +934,7 @@ function freshState(sessionId, cwd, previous, currentFingerprint) {
     reviewPasses: [],
     reviewFailure: null,
     approval: previous?.approval?.fingerprint === currentFingerprint ? previous.approval : null,
+    evidenceByFingerprint: {},
     override:
       previous?.override?.fingerprint === currentFingerprint && previous.override.consumed === false
         ? previous.override
@@ -1098,6 +1108,7 @@ function validState(value, sessionId) {
     && value.reviewPasses.every(validReviewPass)
     && (value.reviewFailure === null || (isRecord(value.reviewFailure) && typeof value.reviewFailure.lane === "string"))
     && (value.approval === null || validApproval(value.approval))
+    && (value.evidenceByFingerprint === undefined || validFingerprintEvidence(value.evidenceByFingerprint))
     && (value.override === null || validOverride(value.override))
     && (value.skip === undefined || value.skip === null || validEvidence(value.skip));
 }
@@ -1131,6 +1142,14 @@ function validApproval(value) {
     && typeof value.source === "string"
     && typeof value.evidence === "string"
     && typeof value.at === "string";
+}
+
+function validFingerprintEvidence(value) {
+  return isRecord(value)
+    && Object.values(value).every((entry) =>
+      isRecord(entry)
+      && (entry.validation === undefined || validEvidence(entry.validation))
+      && (entry.approval === undefined || validApproval(entry.approval)));
 }
 
 function validOverride(value) {
@@ -1812,18 +1831,44 @@ function recoverRevertedViolation(state, currentFingerprint) {
 }
 
 function invalidateForChange(state) {
+  rememberFingerprintEvidence(state);
   state.changed = true;
   state.validation = null;
-  invalidateReview(state);
+  invalidateReview(state, true);
   state.override = null;
   state.stopBlocks = 0;
 }
 
-function invalidateReview(state) {
+function invalidateReview(state, preserveFingerprintEvidence = false) {
   state.reviewAssignments = [];
   state.reviewPasses = [];
   state.reviewFailure = null;
   state.approval = null;
+  if (!preserveFingerprintEvidence) forgetFingerprintApprovals(state);
+}
+
+function rememberFingerprintEvidence(state) {
+  state.evidenceByFingerprint ??= {};
+  for (const key of ["validation", "approval"]) {
+    const value = state[key];
+    if (typeof value?.fingerprint !== "string") continue;
+    state.evidenceByFingerprint[value.fingerprint] = {
+      ...state.evidenceByFingerprint[value.fingerprint],
+      [key]: value,
+    };
+  }
+}
+
+function restoreFingerprintEvidence(state, fingerprint) {
+  const saved = typeof fingerprint === "string" ? state.evidenceByFingerprint?.[fingerprint] : undefined;
+  state.validation = saved?.validation ?? null;
+  state.approval = saved?.approval ?? null;
+}
+
+function forgetFingerprintApprovals(state) {
+  for (const saved of Object.values(state.evidenceByFingerprint ?? {})) {
+    delete saved.approval;
+  }
 }
 
 function success(stdout) {
