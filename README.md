@@ -21,59 +21,6 @@ VoltFlow addresses those problems without forcing the same process onto every ta
 
 ## How it works
 
-```mermaid
-flowchart TB
-    REQUEST(["Change requested"])
-    FULL{"Full workflow needed?"}
-    SKIP["Record why this prompt can skip"]
-    SKIP_DONE(["Finish without deployment approval"])
-    CLASSIFY["1. Classify scope, risk, TDD, and review"]
-    PLAN["2. Record an inline intent or adaptive plan"]
-    WORKERS{"Independent work is useful?"}
-    BUILD["3. Agent executes each bounded step"]
-    DELEGATE["3. Route workers into isolated worktrees"]
-    WORK["Agent and workers execute their assigned steps"]
-    INTEGRATE["4. Adopt current worker evidence"]
-    MERGE["Agent merges the worker result"]
-    VALIDATE["5. Validate the complete current fingerprint"]
-    REVIEW["6. Run the required review and route reviewers when needed"]
-    BLOCKER{"Material blocker found?"}
-    RETRY{"Configured review repeat remains?"}
-    FIX["Fix the shared cause and validate again"]
-    STOP["Stop and report the unresolved blocker"]
-    DELIVERY{"Deployment requested?"}
-    FINISH(["Finish with current evidence"])
-    GATE["7. Check approval against the current fingerprint"]
-    PASS{"Gate passes?"}
-    OVERRIDE{"User explicitly authorizes a one-shot override?"}
-    DEPLOY["Deploy or release"]
-    BLOCKED["Block deployment and report missing evidence"]
-    DONE(["Finish"])
-    CONTRACT["Agent performs engineering work; VoltFlow records and checks evidence"]
-
-    REQUEST --> FULL
-    FULL -->|No| SKIP --> SKIP_DONE
-    FULL -->|Yes| CLASSIFY --> PLAN --> WORKERS
-    WORKERS -->|No| BUILD --> VALIDATE
-    WORKERS -->|Yes| DELEGATE --> WORK --> INTEGRATE --> MERGE --> VALIDATE
-    VALIDATE --> REVIEW --> BLOCKER
-    BLOCKER -->|Yes| RETRY
-    RETRY -->|Yes| FIX --> VALIDATE
-    RETRY -->|No| STOP
-    BLOCKER -->|No| DELIVERY
-    DELIVERY -->|No| FINISH
-    DELIVERY -->|Yes| GATE --> PASS
-    PASS -->|Yes| DEPLOY --> DONE
-    PASS -->|No| OVERRIDE
-    OVERRIDE -->|Yes| DEPLOY
-    OVERRIDE -->|No| BLOCKED
-    CONTRACT -.-> CLASSIFY
-    CONTRACT -.-> BUILD
-    CONTRACT -.-> VALIDATE
-```
-
-The diagram shows the full path. "Agent executes each bounded step" means RED to GREEN slices when TDD is required, or the closest useful check when TDD is exempt. Trivial work may use a short inline intent instead of a stored plan. Prose-only or similarly low-risk work can skip the workflow entirely when there is no deployment intent.
-
 ### 1. Classify the work
 
 Before the first edit, the agent selects a risk tier, TDD mode, and review mode.
@@ -95,11 +42,25 @@ A simple, low-risk task with no executable behavior or deployment intent can use
 
 ### 2. Plan in proportion to risk
 
-Standard and high workflows store an adaptive plan in protected session state. A plan can describe dependencies, parallel lanes, stop conditions, and capped repeats. `status --workflow` reports which steps are ready and shows linked worktrees with their agent bindings and missing evidence.
+Standard and high workflows store an adaptive plan in protected session state. A plan can describe dependencies, parallel lanes, stop conditions, named outcomes, conditional branches, and capped repeats. `status --workflow` reports ready steps, waiting steps, and linked worktrees with their agent bindings and missing evidence.
 
 The plan is coordination data. It does not run commands, create worktrees, approve a review, or bypass any gate. The agent performs those actions.
 
 Plans change only when the evidence changes the work. The agent can update one step with `plan --step` instead of rewriting the whole plan.
+
+Conditional steps use exact outcome names:
+
+```json
+{
+  "id": "fix",
+  "dependsOn": ["review"],
+  "when": { "step": "review", "outcome": "changes-requested" },
+  "outcomes": ["retry", "fixed"],
+  "repeat": { "max": 3, "attempt": 0, "untilOutcome": "fixed" }
+}
+```
+
+The agent records a result with `plan --result '{"id":"review","outcome":"changes-requested","evidence":"Reviewer found a regression"}'`. VoltFlow stores the result under the session lock, updates linked worktrees to the same plan revision, and makes only the matching branch ready. Invalid results leave the plan unchanged. Plans without these conditional fields work as before.
 
 ### 3. Build one behavior at a time
 
@@ -229,8 +190,8 @@ The agent normally receives complete controller commands from the prompt hook. T
 | `start` | Set the tier, TDD mode, and review mode |
 | `skip` | Record why a simple prompt does not need the full workflow |
 | `red` | Record a manual failing test or reproduction |
-| `plan` | Create an adaptive plan or update one step |
-| `status` | Show state, ready plan steps, worktrees, and missing evidence |
+| `plan` | Create a plan, update one step, or record a declared outcome |
+| `status` | Show state, ready and waiting plan steps, worktrees, and missing evidence |
 | `validate` | Record validation for the current fingerprint |
 | `integrate` | Adopt validated evidence from a linked worker worktree |
 | `review` | Create a fingerprint-bound independent review assignment |

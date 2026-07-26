@@ -171,10 +171,13 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /elapsed time.*unchanged wait.*stall/i);
   assert.match(output.hookSpecificOutput.additionalContext, /follow up.*error.*exceeds.*stop condition/i);
   assert.match(output.hookSpecificOutput.additionalContext, /interrupt.*blocking completion.*follow-up.*did not recover/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /create.*linked worktree.*before.*parallel writer/i);
   assert.match(output.hookSpecificOutput.additionalContext, /standard or high.*after start succeeds.*plan.*--spec/i);
   assert.match(output.hookSpecificOutput.additionalContext, /evidence changes/i);
   assert.match(output.hookSpecificOutput.additionalContext, /plan.*--step.*single step/i);
   assert.match(output.hookSpecificOutput.additionalContext, /status.*--workflow.*ready steps.*worktrees/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /before reporting.*failure.*run status/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /exact controller state or tool output/i);
   assert.equal(loadState(fx.dataDir, "session-1").tier, "unclassified");
 });
 
@@ -321,6 +324,9 @@ test("subagent contract limits per-slice TDD to required work", () => {
   assert.match(context, /first user-visible update.*selected model, reasoning effort, and a one-sentence reason/i);
   assert.match(context, /before any tool call or other commentary/i);
   assert.match(context, /copy.*route sentence.*verbatim.*EVIDENCE/i);
+  assert.match(context, /assigned worktree.*before.*writer edit/i);
+  assert.match(context, /before reporting.*failure.*run.*status/i);
+  assert.match(context, /exact controller state or tool output/i);
 });
 
 test("active v2 spawns require isolated context", () => {
@@ -533,6 +539,471 @@ test("adaptive plans are stored in protected state and revised in place", () => 
   }
 });
 
+test("adaptive plans validate conditional outcomes and repeat targets", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement conditional workflow steps" }), fx.options);
+  start(fx);
+  const classify = {
+    id: "classify",
+    action: "Classify it",
+    dependsOn: [],
+    lane: "analysis",
+    stop: "Return A or B",
+    outcomes: ["A", "B"],
+  };
+  const branch = {
+    id: "branch",
+    action: "Handle B",
+    dependsOn: ["classify"],
+    when: { step: "classify", outcome: "B" },
+    lane: "code",
+    stop: "Return Z",
+    outcomes: ["retry", "Z"],
+    repeat: { max: 3, attempt: 0, untilOutcome: "Z" },
+  };
+
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Handle the classified task",
+      steps: [classify, branch],
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+
+  for (const invalidBranch of [
+    { ...branch, outcomes: ["Z", "Z"] },
+    { ...branch, outcomes: ["not valid"] },
+    { ...branch, outcomes: Array.from({ length: 17 }, (_, index) => `result-${index}`) },
+    { ...branch, when: { step: "missing", outcome: "B" } },
+    { ...branch, dependsOn: [], when: { step: "classify", outcome: "B" } },
+    { ...branch, when: { step: "classify", outcome: "C" } },
+    { ...branch, repeat: { max: 3, untilOutcome: "missing" } },
+    { ...branch, repeat: { untilOutcome: "Z" } },
+  ]) {
+    assert.equal(runController(
+      ["plan", "--session", "session-1", "--spec", JSON.stringify({
+        goal: "Reject the invalid graph",
+        steps: [classify, invalidBranch],
+      })],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode, 1);
+  }
+});
+
+test("plan results atomically record outcomes across linked worktrees", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Run a conditional workflow" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const spec = {
+    goal: "Handle the classified task",
+    steps: [
+      {
+        id: "classify",
+        action: "Classify it",
+        dependsOn: [],
+        lane: "analysis",
+        stop: "Return A or B",
+        outcomes: ["A", "B"],
+      },
+      {
+        id: "branch",
+        action: "Handle A",
+        dependsOn: ["classify"],
+        when: { step: "classify", outcome: "A" },
+        lane: "code",
+        stop: "Finish",
+      },
+    ],
+  };
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["status", "--session", "session-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+
+  const recorded = runController(
+    ["plan", "--session", "session-1", "--result", JSON.stringify({
+      id: "classify",
+      outcome: "A",
+      evidence: "Classifier returned A",
+    })],
+    { ...fx.options, cwd: fx.worker },
+  );
+  assert.equal(recorded.exitCode, 0, recorded.stderr);
+
+  for (const cwd of [fx.root, fx.worker]) {
+    const plan = loadState(fx.dataDir, "session-1", cwd).plan;
+    assert.equal(plan.revision, 2);
+    assert.deepEqual(plan.steps[0], {
+      ...spec.steps[0],
+      status: "done",
+      evidence: "Classifier returned A",
+      result: {
+        outcome: "A",
+        evidence: "Classifier returned A",
+        at: plan.steps[0].result.at,
+      },
+    });
+    assert.equal(typeof plan.steps[0].result.at, "string");
+  }
+});
+
+test("workflow readiness selects only the matching outcome branch", () => {
+  for (const [outcome, ready, waiting] of [["A", "C", "D"], ["B", "D", "C"]]) {
+    const fx = fixture();
+    handleHook(input("UserPromptSubmit", { prompt: "Run a conditional workflow" }), fx.options);
+    start(fx);
+    const spec = {
+      goal: "Handle the classified task",
+      steps: [
+        {
+          id: "classify",
+          action: "Classify it",
+          dependsOn: [],
+          lane: "analysis",
+          stop: "Return A or B",
+          outcomes: ["A", "B"],
+        },
+        {
+          id: "C",
+          action: "Handle A",
+          dependsOn: ["classify"],
+          when: { step: "classify", outcome: "A" },
+          lane: "code",
+          stop: "Finish C",
+        },
+        {
+          id: "D",
+          action: "Handle B",
+          dependsOn: ["classify"],
+          when: { step: "classify", outcome: "B" },
+          lane: "code",
+          stop: "Finish D",
+        },
+      ],
+    };
+    assert.equal(runController(
+      ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode, 0);
+    assert.equal(runController(
+      ["plan", "--session", "session-1", "--result", JSON.stringify({
+        id: "classify",
+        outcome,
+        evidence: `Classifier returned ${outcome}`,
+      })],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode, 0);
+
+    const status = runController(
+      ["status", "--session", "session-1", "--workflow"],
+      { ...fx.options, cwd: "/repo" },
+    );
+    assert.equal(status.exitCode, 0, status.stderr);
+    const workflow = JSON.parse(status.stdout);
+    assert.deepEqual(workflow.readySteps, [ready]);
+    assert.deepEqual(workflow.waitingSteps, [{ id: waiting, reason: "outcome" }]);
+  }
+});
+
+test("outcome-driven repeats finish early or block at their attempt limit", () => {
+  const setup = () => {
+    const fx = fixture();
+    handleHook(input("UserPromptSubmit", { prompt: "Run a bounded conditional retry" }), fx.options);
+    start(fx);
+    assert.equal(runController(
+      ["plan", "--session", "session-1", "--spec", JSON.stringify({
+        goal: "Retry D until Z",
+        steps: [
+          {
+            id: "classify",
+            action: "Classify it",
+            dependsOn: [],
+            lane: "analysis",
+            stop: "Return B",
+            outcomes: ["B"],
+          },
+          {
+            id: "D",
+            action: "Retry it",
+            dependsOn: ["classify"],
+            when: { step: "classify", outcome: "B" },
+            lane: "code",
+            stop: "Return Z",
+            outcomes: ["retry", "Z"],
+            repeat: { max: 2, attempt: 0, untilOutcome: "Z" },
+          },
+        ],
+      })],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode, 0);
+    assert.equal(runController(
+      ["plan", "--session", "session-1", "--result", JSON.stringify({
+        id: "classify",
+        outcome: "B",
+        evidence: "Classifier returned B",
+      })],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode, 0);
+    return fx;
+  };
+  const record = (fx, outcome) => runController(
+    ["plan", "--session", "session-1", "--result", JSON.stringify({
+      id: "D",
+      outcome,
+      evidence: `D returned ${outcome}`,
+    })],
+    { ...fx.options, cwd: "/repo" },
+  );
+
+  const early = setup();
+  assert.equal(record(early, "retry").exitCode, 0);
+  assert.deepEqual(
+    loadState(early.dataDir, "session-1").plan.steps[1].repeat,
+    { max: 2, attempt: 1, untilOutcome: "Z" },
+  );
+  assert.equal(loadState(early.dataDir, "session-1").plan.steps[1].status, "pending");
+  assert.deepEqual(
+    JSON.parse(runController(
+      ["status", "--session", "session-1", "--workflow"],
+      { ...early.options, cwd: "/repo" },
+    ).stdout).readySteps,
+    ["D"],
+  );
+  assert.equal(record(early, "Z").exitCode, 0);
+  assert.equal(loadState(early.dataDir, "session-1").plan.steps[1].status, "done");
+
+  const exhausted = setup();
+  assert.equal(record(exhausted, "retry").exitCode, 0);
+  assert.equal(record(exhausted, "retry").exitCode, 0);
+  const step = loadState(exhausted.dataDir, "session-1").plan.steps[1];
+  assert.equal(step.status, "blocked");
+  assert.equal(step.repeat.attempt, 2);
+  assert.equal(step.evidence, "D returned retry");
+  assert.deepEqual(
+    JSON.parse(runController(
+      ["status", "--session", "session-1", "--workflow"],
+      { ...exhausted.options, cwd: "/repo" },
+    ).stdout).waitingSteps,
+    [{ id: "D", reason: "retry-exhausted" }],
+  );
+  const beforeReactivation = JSON.stringify(loadState(exhausted.dataDir, "session-1").plan);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({ id: "D", status: "active" })],
+    { ...exhausted.options, cwd: "/repo" },
+  ).exitCode, 1);
+  assert.equal(JSON.stringify(loadState(exhausted.dataDir, "session-1").plan), beforeReactivation);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({ id: "D", repeat: { max: 3 } })],
+    { ...exhausted.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.equal(loadState(exhausted.dataDir, "session-1").plan.steps[1].status, "pending");
+  assert.equal(record(exhausted, "Z").exitCode, 0);
+
+  const raisedBySpec = setup();
+  assert.equal(record(raisedBySpec, "retry").exitCode, 0);
+  assert.equal(record(raisedBySpec, "retry").exitCode, 0);
+  const stored = loadState(raisedBySpec.dataDir, "session-1").plan;
+  const raisedSpec = {
+    goal: stored.goal,
+    steps: stored.steps.map(({ status, evidence, result, ...step }) => step.id === "D"
+      ? { ...step, repeat: { max: 3, untilOutcome: "Z" } }
+      : step),
+  };
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(raisedSpec)],
+    { ...raisedBySpec.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.equal(loadState(raisedBySpec.dataDir, "session-1").plan.steps[1].status, "pending");
+  assert.equal(record(raisedBySpec, "Z").exitCode, 0);
+});
+
+test("plan results reject unsafe state changes and preserve legacy readiness", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Run a safe conditional workflow" }), fx.options);
+  start(fx);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Handle the classified task",
+      steps: [
+        {
+          id: "classify",
+          action: "Classify it",
+          dependsOn: [],
+          lane: "analysis",
+          stop: "Return A or B",
+          outcomes: ["A", "B"],
+        },
+        {
+          id: "D",
+          action: "Handle B",
+          dependsOn: ["classify"],
+          when: { step: "classify", outcome: "B" },
+          lane: "code",
+          stop: "Finish D",
+          outcomes: ["done"],
+        },
+      ],
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+  const rejectWithoutChange = (args) => {
+    const before = JSON.stringify(loadState(fx.dataDir, "session-1").plan);
+    assert.equal(runController(args, { ...fx.options, cwd: "/repo" }).exitCode, 1);
+    assert.equal(JSON.stringify(loadState(fx.dataDir, "session-1").plan), before);
+  };
+
+  rejectWithoutChange(["plan", "--session", "session-1", "--result", JSON.stringify({
+    id: "missing",
+    outcome: "A",
+    evidence: "Unknown step",
+  })]);
+  rejectWithoutChange(["plan", "--session", "session-1", "--result", JSON.stringify({
+    id: "classify",
+    outcome: "C",
+    evidence: "Invalid outcome",
+  })]);
+  rejectWithoutChange(["plan", "--session", "session-1", "--result", JSON.stringify({
+    id: "D",
+    outcome: "done",
+    evidence: "Dependency is not done",
+  })]);
+  rejectWithoutChange(["plan", "--session", "session-1", "--step", JSON.stringify({
+    id: "classify",
+    status: "done",
+    evidence: "Missing declared outcome",
+  })]);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--result", JSON.stringify({
+      id: "classify",
+      outcome: "A",
+      evidence: "Classifier returned A",
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+  rejectWithoutChange(["plan", "--session", "session-1", "--result", JSON.stringify({
+    id: "classify",
+    outcome: "A",
+    evidence: "Already complete",
+  })]);
+  rejectWithoutChange(["plan", "--session", "session-1", "--result", JSON.stringify({
+    id: "D",
+    outcome: "done",
+    evidence: "Wrong branch",
+  })]);
+  rejectWithoutChange(["plan", "--session", "session-1", "--step", JSON.stringify({
+    id: "D",
+    status: "active",
+  })]);
+  rejectWithoutChange(["plan", "--session", "session-1", "--step", JSON.stringify({
+    id: "classify",
+    outcomes: ["B"],
+  })]);
+  rejectWithoutChange(["plan", "--session", "session-1", "--step", JSON.stringify({
+    id: "classify",
+    result: { outcome: "B", evidence: "Rewritten result", at: new Date().toISOString() },
+  })]);
+  const forged = structuredClone(loadState(fx.dataDir, "session-1").plan);
+  delete forged.revision;
+  delete forged.updatedAt;
+  forged.steps[0].result.outcome = "B";
+  forged.steps[0].evidence = "Forged B result";
+  rejectWithoutChange(["plan", "--session", "session-1", "--spec", JSON.stringify(forged)]);
+
+  const bounded = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Run a bounded retry" }), bounded.options);
+  start(bounded);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Retry until Z",
+      steps: [{
+        id: "retry",
+        action: "Retry it",
+        dependsOn: [],
+        lane: "code",
+        stop: "Return Z",
+        outcomes: ["again", "Z"],
+        repeat: { max: 2, attempt: 0, untilOutcome: "Z" },
+      }],
+    })],
+    { ...bounded.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--result", JSON.stringify({
+      id: "retry",
+      outcome: "again",
+      evidence: "Retry requested",
+    })],
+    { ...bounded.options, cwd: "/repo" },
+  ).exitCode, 0);
+  const beforeReset = JSON.stringify(loadState(bounded.dataDir, "session-1").plan);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({
+      id: "retry",
+      repeat: { attempt: 0 },
+    })],
+    { ...bounded.options, cwd: "/repo" },
+  ).exitCode, 1);
+  assert.equal(JSON.stringify(loadState(bounded.dataDir, "session-1").plan), beforeReset);
+  const revised = structuredClone(loadState(bounded.dataDir, "session-1").plan);
+  delete revised.revision;
+  delete revised.updatedAt;
+  delete revised.steps[0].result;
+  delete revised.steps[0].status;
+  delete revised.steps[0].evidence;
+  revised.steps[0].repeat.attempt = 0;
+  revised.steps[0].action = "Retry it with updated instructions";
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(revised)],
+    { ...bounded.options, cwd: "/repo" },
+  ).exitCode, 0);
+  const preserved = loadState(bounded.dataDir, "session-1").plan.steps[0];
+  assert.equal(preserved.action, "Retry it with updated instructions");
+  assert.equal(preserved.repeat.attempt, 1);
+  assert.equal(preserved.result.outcome, "again");
+
+  const legacy = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Run a legacy workflow" }), legacy.options);
+  start(legacy);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Run the legacy plan",
+      steps: [
+        {
+          id: "build",
+          action: "Build it",
+          dependsOn: [],
+          lane: "code",
+          stop: "Build passes",
+          repeat: { max: 2, attempt: 2, until: "Build passes" },
+          evidence: "Retry requested",
+        },
+        {
+          id: "review",
+          action: "Review it",
+          dependsOn: ["build"],
+          lane: "review",
+          stop: "Review passes",
+        },
+      ],
+    })],
+    { ...legacy.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.deepEqual(
+    JSON.parse(runController(
+      ["status", "--session", "session-1", "--workflow"],
+      { ...legacy.options, cwd: "/repo" },
+    ).stdout).readySteps,
+    ["build"],
+  );
+});
+
 test("adaptive plans can revise one step without reposting the full plan", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Implement the parser" }), fx.options);
@@ -581,6 +1052,35 @@ test("adaptive plans can revise one step without reposting the full plan", () =>
   );
   assert.equal(invalid.exitCode, 1);
   assert.equal(loadState(fx.dataDir, "session-1").plan.revision, 2);
+});
+
+test("legacy blocked steps remain editable without repeat metadata", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Revise a legacy blocked plan" }), fx.options);
+  start(fx);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Finish the legacy step",
+      steps: [{
+        id: "legacy",
+        action: "Try the old workflow",
+        dependsOn: [],
+        lane: "code",
+        stop: "Unblock it",
+        status: "blocked",
+        evidence: "Legacy workflow blocked",
+      }],
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--step", JSON.stringify({
+      id: "legacy",
+      action: "Try the revised workflow",
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
 });
 
 test("adaptive plan revisions propagate across linked worktrees", () => {
@@ -780,6 +1280,39 @@ test("validated worker evidence can be adopted before an integration merge", () 
   assert.equal(state.validation, null);
 });
 
+test("validated worker evidence accepts an exact fast-forward merge", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["red", "--session", "session-1", "--evidence", "focused worker regression failed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  writeFileSync(path.join(fx.worker, "README.md"), "worker change\n");
+  git(fx.worker, "add", "README.md");
+  git(fx.worker, "commit", "-qm", "worker change");
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "worker tests passed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["integrate", "--session", "session-1", "--from", fx.worker],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  git(fx.root, "merge", "worker");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "Bash",
+    tool_input: { command: "rtk git merge worker" },
+    tool_response: { exit_code: 0, output: "Fast-forward" },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1", fx.root).tddViolation, false);
+});
+
 test("an unapproved integration merge still requires RED", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
@@ -836,7 +1369,7 @@ test("integrated RED evidence cannot approve a different worker merge", () => {
     cwd: fx.root,
     tool_name: "Bash",
     tool_input: {
-      command: "rtk git merge --no-ff codex/unrelated-live-smoke -m 'test: integrate unrelated worker smoke'",
+      command: "rtk git merge --no-ff codex/unrelated-live-smoke -m 'merge unrelated'",
     },
     tool_response: { exit_code: 0, output: "Merge made by the ort strategy." },
   }), fx.options);
@@ -1050,6 +1583,86 @@ test("review receipts route to their assigned worktree state", () => {
   }), fx.options), null);
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).reviewPasses.length, 1);
   assert.equal(loadState(fx.dataDir, "session-1", fx.root).reviewPasses.length, 0);
+});
+
+test("a connector deployment uses the only reviewed linked worktree", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Build and deploy the site" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "standard", "--tdd", "exempt", "--review", "single"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  writeFileSync(path.join(fx.worker, "README.md"), "reviewed worker\n");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(fx.worker, "README.md") },
+    tool_response: "Success",
+  }), fx.options);
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "exec_command",
+    tool_input: { cmd: "node --test", workdir: fx.worker },
+    tool_response: { exit_code: 0, output: "TAP version 13\nok 1 - site" },
+  }), fx.options);
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "site checks passed"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  const assigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: fx.worker },
+  );
+  assert.equal(assigned.exitCode, 0, assigned.stderr);
+  const token = /token=(\S+)/.exec(assigned.stdout)?.[1];
+  assert.ok(token);
+  handleHook(input("SubagentStop", {
+    cwd: fx.root,
+    agent_id: "site-reviewer",
+    last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${token}`,
+  }), fx.options);
+
+  assert.equal(handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "mcp__codex_apps__sites__deploy_private_site_version",
+    tool_input: { site_id: "site-1", version_id: "version-1" },
+  }), fx.options), null);
+  assert.equal(handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "Bash",
+    tool_input: { command: "npm run deploy" },
+  }), fx.options).hookSpecificOutput.permissionDecision, "deny");
+
+  const secondWorker = mkdtempSync(path.join(tmpdir(), "voltflow-worker-"));
+  git(fx.root, "worktree", "add", "-qb", "worker-2", secondWorker);
+  writeFileSync(path.join(secondWorker, "README.md"), "second reviewed worker\n");
+  handleHook(input("PostToolUse", {
+    cwd: fx.root,
+    tool_name: "apply_patch",
+    tool_input: { path: path.join(secondWorker, "README.md") },
+    tool_response: "Success",
+  }), fx.options);
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "second site checks passed"],
+    { ...fx.options, cwd: secondWorker },
+  ).exitCode, 0);
+  const secondAssigned = runController(
+    ["review", "--session", "session-1", "--lane", "composite"],
+    { ...fx.options, cwd: secondWorker },
+  );
+  const secondToken = /token=(\S+)/.exec(secondAssigned.stdout)?.[1];
+  assert.ok(secondToken);
+  handleHook(input("SubagentStop", {
+    cwd: fx.root,
+    agent_id: "second-site-reviewer",
+    last_assistant_message: `VOLTFLOW_REVIEW: PASS composite ${secondToken}`,
+  }), fx.options);
+
+  assert.equal(handleHook(input("PreToolUse", {
+    cwd: fx.root,
+    tool_name: "mcp__codex_apps__sites__deploy_private_site_version",
+    tool_input: { site_id: "site-1", version_id: "version-1" },
+  }), fx.options).hookSpecificOutput.permissionDecision, "deny");
 });
 
 test("a live review receipt can retry after generated artifacts are removed", async () => {
@@ -1428,6 +2041,7 @@ test("reverting a pre-RED production edit clears the violation", () => {
     { ...fx.options, fingerprint: () => "diff-b" },
   );
   assert.equal(loadState(fx.dataDir, "session-1").tddViolation, true);
+  assert.equal(productionPatchDecision(fx), null);
 
   handleHook(
     input("PostToolUse", {
@@ -1517,10 +2131,33 @@ test("an unfinished workflow reactivates when the user says continue", () => {
   assert.equal(loadState(fx.dataDir, "session-1").changed, true);
 });
 
+test("an explicit start on a new prompt replaces the prior workflow", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Remove obsolete docs" }), fx.options);
+  start(fx, { tier: "trivial", tdd: "exempt", review: "self" });
+  recordProductionEdit(fx);
+  passedTest(fx);
+  assert.equal(runController(
+    ["approve", "--self", "--session", "session-1", "--evidence", "docs checked"],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+  fx.setFingerprint("other-branch");
+  handleHook(input("UserPromptSubmit", { prompt: "Fix the workflow engine" }), fx.options);
+
+  const restarted = runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: "/repo" },
+  );
+
+  assert.equal(restarted.exitCode, 0, restarted.stderr);
+  assert.equal(loadState(fx.dataDir, "session-1").tdd, "required");
+});
+
 test("controller help lists the workflow commands", () => {
   const result = runController(["--help"]);
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /start\|skip\|red\|validate\|integrate\|plan\|review\|approve\|status\|gate/);
+  assert.match(result.stdout, /plan: --spec <JSON> \| --step <JSON> \| --result <JSON>/);
 });
 
 function productionPatchDecision(fx) {
@@ -1809,6 +2446,59 @@ test("a wrapper setup failure cannot masquerade as test-runner output", () => {
   }), fx.options);
 
   assert.equal(loadState(fx.dataDir, "session-1").red, null);
+});
+
+test("a missing production module is setup failure, not RED", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement the dashboard" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "node --test test/ui/app.test.js" },
+    tool_response: {
+      exit_code: 1,
+      output: [
+        "TAP version 13",
+        "Error: Cannot find module '../../public/app'",
+        "code: 'MODULE_NOT_FOUND'",
+        "not ok 1 - test/ui/app.test.js",
+        "code: 'ERR_TEST_FAILURE'",
+      ].join("\n"),
+    },
+  }), fx.options);
+
+  assert.equal(loadState(fx.dataDir, "session-1").red, null);
+  const decision = handleHook(productionPatch(), fx.options);
+  assert.equal(decision.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(
+    decision.hookSpecificOutput.permissionDecisionReason,
+    /requires a failing test or reproduction/i,
+  );
+});
+
+test("an assertion mentioning MODULE_NOT_FOUND still records RED", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Handle missing modules" }), fx.options);
+  start(fx);
+
+  handleHook(input("PostToolUse", {
+    tool_name: "Bash",
+    tool_input: { command: "node --test test/errors.test.js" },
+    tool_response: {
+      exit_code: 1,
+      output: [
+        "TAP version 13",
+        "not ok 1 - maps loader errors",
+        "Expected values to be strictly equal:",
+        "+ actual - expected",
+        "+ 'ERR_OTHER'",
+        "- 'MODULE_NOT_FOUND'",
+      ].join("\n"),
+    },
+  }), fx.options);
+
+  assert.match(loadState(fx.dataDir, "session-1").red.details, /node --test/);
 });
 
 test("review receipts require a fingerprint-bound assignment token", () => {

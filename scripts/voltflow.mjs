@@ -62,7 +62,7 @@ const USAGE = [
   "skip: --evidence <reason> (simple work only, before any change)",
   "red|validate: --evidence <text>",
   "integrate: --from <validated worker worktree>",
-  "plan: --spec <JSON> | --step <JSON>",
+  "plan: --spec <JSON> | --step <JSON> | --result <JSON>",
   "status: [--agent <id>] [--workflow]",
   "review: --lane composite|correctness-security|validation-scope",
   "approve: --self --evidence <text>",
@@ -254,20 +254,52 @@ export function runController(argv, options = {}) {
     if (!["standard", "high"].includes(state.tier) || state.active !== true) {
       return failure("adaptive plans require an active standard or high workflow");
     }
+    if ([flags.spec, flags.step, flags.result].filter((value) => value !== undefined).length !== 1) {
+      return failure("plan requires exactly one of --spec, --step, or --result");
+    }
     let spec = parsePlanSpec(flags.spec);
+    if (flags.spec !== undefined && spec !== null && state.plan !== null) {
+      const existingSteps = new Map(state.plan.steps.map((step) => [step.id, step]));
+      spec = {
+        ...spec,
+        steps: spec.steps.map((step) => {
+          const existing = existingSteps.get(step.id);
+          if (existing?.result === undefined) return step;
+          const revised = {
+            ...step,
+            evidence: existing.evidence,
+            result: existing.result,
+            ...(existing.repeat?.untilOutcome !== undefined && step.repeat !== undefined
+              ? { repeat: { ...step.repeat, attempt: existing.repeat.attempt ?? 0 } }
+              : {}),
+          };
+          return { ...revised, status: repeatRevisionStatus(existing, revised) };
+        }),
+      };
+    }
     if (flags.step !== undefined) {
       const patch = parsePlanStep(flags.step);
       const existing = state.plan?.steps.find((step) => step.id === patch?.id);
-      if (patch === null || state.plan === null) {
+      if (
+        patch === null
+        || state.plan === null
+        || Object.hasOwn(patch, "result")
+        || existing?.repeat?.untilOutcome !== undefined
+          && isRecord(patch.repeat)
+          && Object.hasOwn(patch.repeat, "attempt")
+      ) {
         return failure("plan --step requires valid JSON and an existing plan");
       }
-      const step = {
+      let step = {
         ...existing,
         ...patch,
         ...(existing?.repeat !== undefined && patch.repeat !== undefined
           ? { repeat: { ...existing.repeat, ...patch.repeat } }
           : {}),
       };
+      if (existing !== undefined && !Object.hasOwn(patch, "status")) {
+        step = { ...step, status: repeatRevisionStatus(existing, step) };
+      }
       spec = {
         goal: state.plan.goal,
         steps: existing === undefined
@@ -275,6 +307,40 @@ export function runController(argv, options = {}) {
           : state.plan.steps.map((candidate) => candidate.id === step.id ? step : candidate),
       };
       if (!validPlan(spec, false)) return failure("plan --step would make the plan invalid");
+    }
+    if (flags.result !== undefined) {
+      const result = parsePlanResult(flags.result);
+      const existing = state.plan?.steps.find((step) => step.id === result?.id);
+      if (result === null || state.plan === null || existing === undefined) {
+        return failure("plan --result requires valid JSON and an existing step");
+      }
+      const statuses = new Map(state.plan.steps.map((step) => [step.id, step.status]));
+      const source = existing.when === undefined
+        ? undefined
+        : state.plan.steps.find((step) => step.id === existing.when.step);
+      if (
+        !existing.outcomes?.includes(result.outcome)
+        || ["done", "blocked"].includes(existing.status)
+        || existing.dependsOn.some((id) => statuses.get(id) !== "done")
+        || existing.when !== undefined && source?.result?.outcome !== existing.when.outcome
+      ) {
+        return failure("plan --result is not valid for the current step state");
+      }
+      const attempt = (existing.repeat?.attempt ?? 0) + 1;
+      const repeats = existing.repeat?.untilOutcome !== undefined;
+      const complete = !repeats || result.outcome === existing.repeat.untilOutcome;
+      const step = {
+        ...existing,
+        status: complete ? "done" : attempt >= existing.repeat.max ? "blocked" : "pending",
+        evidence: result.evidence,
+        result: { outcome: result.outcome, evidence: result.evidence, at: timestamp() },
+        ...(repeats ? { repeat: { ...existing.repeat, attempt: complete ? existing.repeat.attempt ?? 0 : attempt } } : {}),
+      };
+      spec = {
+        goal: state.plan.goal,
+        steps: state.plan.steps.map((candidate) => candidate.id === step.id ? step : candidate),
+      };
+      if (!validPlan(spec, false)) return failure("plan --result would make the plan invalid");
     }
     if (spec === null) return failure("plan requires a valid bounded --spec JSON value");
     const peers = relatedStates(dataDir, sessionId, cwd).filter((peer) =>
@@ -483,8 +549,8 @@ function onUserPromptLocked(input, context) {
     return userContext("VoltFlow deployment override armed for one matching deployment on the current diff.");
   }
 
-  const unfinished = previous?.changed === true && previous.approval?.fingerprint !== current;
-  const continuing = previous?.active === true || unfinished;
+  const unfinished = previous?.changed === true && previous.approval === null;
+  const continuing = previous?.active === true && previous.approval === null || unfinished;
   const state = continuing
     ? previous
     : freshState(input.session_id, input.cwd, previous, current);
@@ -526,11 +592,13 @@ function onUserPromptLocked(input, context) {
       `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
       `For a simple, low-risk edit with no deployment intent, replace start with skip and add --evidence <reason>; skip must happen before any change and does not approve deployment. ` +
       `For standard or high work, after start succeeds run ${prefix.replace("<command>", "plan")} --spec <JSON> to store the bounded adaptive plan; revise it only when evidence changes the work. ` +
-      `Use ${prefix.replace("<command>", "plan")} --step <JSON> to update a single step, and ${prefix.replace("<command>", "status")} --workflow to see ready steps and linked worktrees. ` +
+      `Use ${prefix.replace("<command>", "plan")} --step <JSON> to update a single step, ${prefix.replace("<command>", "plan")} --result <JSON> to record a declared outcome, and ${prefix.replace("<command>", "status")} --workflow to see ready steps, waiting reasons, and linked worktrees. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
       `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
+      `Create a distinct linked worktree before spawning each parallel writer, include its absolute path in the assignment, and require the writer's first controller status command to run there. ` +
       `When a subagent spawn or status reports "Selected model is at capacity", wait 3, 6, and 9 seconds for the first three retries, then use a 9-second cap, for at most ten replacement spawns; preserve the same assignment, model, reasoning, scope, and evidence contract, and stop after the first success or a different error. ` +
       `Higher reasoning efforts can take longer. Do not treat elapsed time or an unchanged wait as a stall. Follow up only when the worker asks for help, reports an error, or exceeds its stop condition. Interrupt only when the worker is blocking completion and a follow-up did not recover it. ` +
+      `Before reporting a workflow failure or its cause, run status and cite the exact controller state or tool output; label any inference instead of presenting it as observed fact. ` +
       `Completion bar: finish when current evidence shows the result is safe and satisfies the requested scope. Theoretical edge cases are advisory unless they are reproducible in ordinary documented use and break requested behavior, a repository invariant, or a material safety boundary. Do not reopen validated work for speculative improvement.${configNote}`,
   );
 }
@@ -585,16 +653,30 @@ function onPreToolUse(input, context) {
 
   if (isDeployInvocation(input.tool_name, input.tool_input, workspace.cwd)) {
     if (state === null) return deny("VoltFlow blocked deployment: no workflow state or review receipt exists.");
-    const current = context.fingerprint(workspace.cwd);
-    const gate = gateStatus(state, current);
+    let gateState = state;
+    let gateCwd = workspace.cwd;
+    let current = context.fingerprint(gateCwd);
+    let gate = gateStatus(gateState, current);
+    if (!gate.allowed && !isCommandTool(input.tool_name) && workdirsFrom(input.tool_input).length === 0) {
+      const workflowId = state.workflowId ?? state.promptHash;
+      const reviewed = relatedStates(context.dataDir, input.session_id, workspace.cwd).filter((candidate) =>
+        (candidate.workflowId ?? candidate.promptHash) === workflowId
+        && gateStatus(candidate, context.fingerprint(candidate.cwd)).source === "review receipt");
+      if (reviewed.length === 1) {
+        [gateState] = reviewed;
+        gateCwd = gateState.cwd;
+        current = context.fingerprint(gateCwd);
+        gate = gateStatus(gateState, current);
+      }
+    }
     if (!gate.allowed) return deny(`VoltFlow blocked deployment: ${gate.reason}`);
     if (gate.source === "user override") {
       return withStateLock(context.dataDir, input.session_id, () => {
-        const fresh = loadState(context.dataDir, input.session_id, workspace.cwd);
+        const fresh = loadState(context.dataDir, input.session_id, gateCwd);
         if (fresh === null) {
           return deny("VoltFlow blocked deployment: workflow state changed before the override could be consumed.");
         }
-        const freshGate = gateStatus(fresh, context.fingerprint(workspace.cwd));
+        const freshGate = gateStatus(fresh, context.fingerprint(gateCwd));
         if (freshGate.source !== "user override") {
           return deny(`VoltFlow blocked deployment: ${freshGate.reason ?? "the one-shot override was already consumed"}.`);
         }
@@ -615,7 +697,12 @@ function onPreToolUse(input, context) {
   if (state.tdd === "required" && paths.some(isTestPath) && paths.some((file) => !isTestPath(file))) {
     return deny("VoltFlow requires test and production edits to be separate. Update the test, rerun RED, then edit production.");
   }
-  if (state.tdd === "required" && state.red === null && paths.some((file) => !isTestPath(file))) {
+  if (
+    state.tdd === "required"
+    && state.red === null
+    && state.tddViolation !== true
+    && paths.some((file) => !isTestPath(file))
+  ) {
     return deny("VoltFlow requires a failing test or reproduction before production edits. Add the focused test, run it, and verify the expected failure.");
   }
   return null;
@@ -673,9 +760,15 @@ function onPostToolUseLocked(input, context) {
       state.tdd === "required"
       && state.red !== null
       && state.tddViolation !== true
-      && touchesTest
-      && touchesProduction
-      && !(command !== null && isGitMergeCommand(command) && matchesIntegratedMerge(state.red, workspace.cwd))
+      && (
+        command !== null
+          && isGitMergeCommand(command)
+          && isRecord(state.red.integration)
+          && !matchesIntegratedMerge(state.red, workspace.cwd)
+        || touchesTest
+          && touchesProduction
+          && !(command !== null && isGitMergeCommand(command) && matchesIntegratedMerge(state.red, workspace.cwd))
+      )
     ) {
       state.tddViolation = true;
       state.violationBaseFingerprint = fingerprintChanged ? state.lastFingerprint : null;
@@ -692,7 +785,7 @@ function onPostToolUseLocked(input, context) {
   }
 
   if (testCommand) {
-    if (failed && state.tdd === "required" && state.tddViolation !== true) {
+    if (failed && !testSetupFailed(input.tool_response) && state.tdd === "required" && state.tddViolation !== true) {
       state.red = evidence(command, current);
       state.redObserved = state.red;
     }
@@ -712,7 +805,7 @@ function onSubagentStart(input, context) {
     hookSpecificOutput: {
       hookEventName: "SubagentStart",
       additionalContext:
-        `VoltFlow subtask contract: Before any tool call or other commentary, your first user-visible update must copy the ROUTE sentence verbatim from the assignment's EVIDENCE field; it states the selected model, reasoning effort, and a one-sentence reason. ${prefix === null ? "" : `Run ${prefix} from the assigned worktree; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
+        `VoltFlow subtask contract: Before any tool call or other commentary, your first user-visible update must copy the ROUTE sentence verbatim from the assignment's EVIDENCE field; it states the selected model, reasoning effort, and a one-sentence reason. ${prefix === null ? "" : `Run ${prefix} from the assigned worktree before any writer edit; use external permission if protected plugin state is sandboxed. `}Stay inside the assigned WORK LAYER, OUTCOME, and SCOPE; assigned paths may be new unless the assignment says they must already exist. Return the requested EVIDENCE and stop at the stated condition. When TDD is required, define one behavior per implementation slice: write one focused test, observe the expected RED, make the minimum production change, reach GREEN, and finish RED→GREEN before starting the next slice. Do not batch tests or implement later behavior. For TDD-exempt work, do not create tests; use the closest useful validation. Validate every changed observable layer; syntax checks do not prove runtime behavior. Do not add adjacent cleanup or abstractions. Before reporting a workflow failure or its cause, run the controller status command and cite the exact controller state or tool output; label any inference instead of presenting it as observed fact. A final reviewer must cover correctness, relevant security, validation quality, and excess scope. A finding blocks only when it is reproducible in ordinary documented use and breaks requested behavior, a repository invariant, or a material safety boundary; theoretical edge cases are advisory. PASS means the result is safe and satisfies scope, not that no improvement remains. Before returning a review receipt, remove only generated artifacts created by validation and confirm the assigned worktree fingerprint is unchanged. End with the exact assigned receipt VOLTFLOW_REVIEW: PASS <lane> <token> only when a material blocker remains absent; otherwise use FAIL with the same lane and token after reporting every blocker in one pass.`,
     },
   };
 }
@@ -886,13 +979,14 @@ function pendingReasons(state, currentFingerprint) {
 
 function workflowStatus(dataDir, sessionId, cwd, state, fingerprint) {
   const workflowId = state.workflowId ?? state.promptHash;
+  const readiness = planReadiness(state.plan);
   return {
     workflowId,
     tier: state.tier,
     tdd: state.tdd,
     reviewMode: state.reviewMode,
     plan: state.plan,
-    readySteps: readyPlanSteps(state.plan),
+    ...readiness,
     worktrees: loadSessionStates(dataDir, sessionId)
       .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId && sameRepository(entry.cwd, cwd))
       .map((entry) => ({
@@ -1051,7 +1145,10 @@ function parsePlanSpec(value) {
   if (typeof value !== "string") return null;
   try {
     const spec = JSON.parse(value);
-    return validPlan(spec, false) ? spec : null;
+    return validPlan(spec, false)
+      && !spec.steps.some((step) => Object.hasOwn(step, "result"))
+      ? spec
+      : null;
   } catch {
     return null;
   }
@@ -1062,6 +1159,21 @@ function parsePlanStep(value) {
   try {
     const step = JSON.parse(value);
     return isRecord(step) && typeof step.id === "string" ? step : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePlanResult(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const result = JSON.parse(value);
+    return isRecord(result)
+      && typeof result.id === "string"
+      && validOutcomeName(result.outcome)
+      && textWithin(result.evidence, 2000)
+      ? result
+      : null;
   } catch {
     return null;
   }
@@ -1079,14 +1191,60 @@ function validPlan(value, stored = true) {
     if (!step.dependsOn.every((id) => typeof id === "string")) return false;
     if (step.status !== undefined && !PLAN_STATUSES.has(step.status)) return false;
     if (step.evidence !== undefined && !textWithin(step.evidence, 2000)) return false;
+    if (step.outcomes !== undefined && (
+      !Array.isArray(step.outcomes)
+      || step.outcomes.length === 0
+      || step.outcomes.length > 16
+      || new Set(step.outcomes).size !== step.outcomes.length
+      || !step.outcomes.every(validOutcomeName)
+    )) return false;
+    if (step.when !== undefined && (
+      !isRecord(step.when)
+      || typeof step.when.step !== "string"
+      || !validOutcomeName(step.when.outcome)
+    )) return false;
     if (step.repeat !== undefined && !validRepeat(step.repeat)) return false;
+    if (step.repeat?.untilOutcome !== undefined && (
+      step.outcomes === undefined
+      || !step.outcomes.includes(step.repeat.untilOutcome)
+    )) return false;
+    if (step.result !== undefined && (
+      !isRecord(step.result)
+      || !step.outcomes?.includes(step.result.outcome)
+      || !textWithin(step.result.evidence, 2000)
+      || typeof step.result.at !== "string"
+      || step.evidence !== step.result.evidence
+    )) return false;
+    if (step.outcomes !== undefined && step.status === "done" && step.result === undefined) return false;
+    if (step.result !== undefined && step.repeat?.untilOutcome === undefined && step.status !== "done") return false;
+    if (step.repeat?.untilOutcome !== undefined) {
+      const attempt = step.repeat.attempt ?? 0;
+      if (attempt > 0 && step.result === undefined) return false;
+      if (step.result?.outcome === step.repeat.untilOutcome && step.status !== "done") return false;
+      if (
+        step.result !== undefined
+        && step.result.outcome !== step.repeat.untilOutcome
+        && step.status !== (attempt >= step.repeat.max ? "blocked" : "pending")
+        && !(step.status === "active" && attempt < step.repeat.max)
+      ) return false;
+      if (["done", "blocked"].includes(step.status) && step.result === undefined) return false;
+    }
     if ((["done", "blocked"].includes(step.status) || (step.repeat?.attempt ?? 0) > 0) && !textWithin(step.evidence, 2000)) return false;
     ids.add(step.id);
   }
   if (value.steps.some((step) => step.dependsOn.some((id) => !ids.has(id) || id === step.id))) return false;
+  const steps = new Map(value.steps.map((step) => [step.id, step]));
+  if (value.steps.some((step) => step.when !== undefined && (
+    !step.dependsOn.includes(step.when.step)
+    || !steps.get(step.when.step)?.outcomes?.includes(step.when.outcome)
+  ))) return false;
   const statuses = new Map(value.steps.map((step) => [step.id, step.status]));
   if (value.steps.some((step) =>
     ["active", "done"].includes(step.status) && step.dependsOn.some((id) => statuses.get(id) !== "done"))) return false;
+  if (value.steps.some((step) =>
+    ["active", "done"].includes(step.status)
+    && step.when !== undefined
+    && steps.get(step.when.step)?.result?.outcome !== step.when.outcome)) return false;
   return !planHasCycle(value.steps);
 }
 
@@ -1095,16 +1253,53 @@ function validRepeat(value) {
     && Number.isInteger(value.max)
     && value.max >= 1
     && value.max <= 10
-    && textWithin(value.until, 1000)
+    && (textWithin(value.until, 1000) || validOutcomeName(value.untilOutcome))
     && (value.attempt === undefined || Number.isInteger(value.attempt) && value.attempt >= 0 && value.attempt <= value.max);
 }
 
-function readyPlanSteps(plan) {
-  if (plan === null || plan === undefined) return [];
+function repeatRevisionStatus(existing, revised) {
+  return existing.status === "blocked"
+    && existing.repeat?.untilOutcome !== undefined
+    && existing.repeat.untilOutcome === revised.repeat?.untilOutcome
+    && revised.repeat.max > (existing.repeat.attempt ?? 0)
+    ? "pending"
+    : existing.status;
+}
+
+function validOutcomeName(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+function planReadiness(plan) {
+  if (plan === null || plan === undefined) return { readySteps: [], waitingSteps: [] };
   const done = new Set(plan.steps.filter((step) => step.status === "done").map((step) => step.id));
-  return plan.steps
-    .filter((step) => [undefined, "pending"].includes(step.status) && step.dependsOn.every((id) => done.has(id)))
-    .map((step) => step.id);
+  const steps = new Map(plan.steps.map((step) => [step.id, step]));
+  const readySteps = [];
+  const waitingSteps = [];
+  for (const step of plan.steps) {
+    if (!["pending", undefined].includes(step.status)) {
+      if (step.status === "blocked" && step.repeat?.untilOutcome !== undefined) {
+        waitingSteps.push({ id: step.id, reason: "retry-exhausted" });
+      }
+      continue;
+    }
+    if (!step.dependsOn.every((id) => done.has(id))) {
+      waitingSteps.push({ id: step.id, reason: "dependency" });
+    } else if (
+      step.when !== undefined
+      && steps.get(step.when.step)?.result?.outcome !== step.when.outcome
+    ) {
+      waitingSteps.push({ id: step.id, reason: "outcome" });
+    } else if (
+      step.repeat?.untilOutcome !== undefined
+      && (step.repeat.attempt ?? 0) >= step.repeat.max
+    ) {
+      waitingSteps.push({ id: step.id, reason: "retry-exhausted" });
+    } else {
+      readySteps.push(step.id);
+    }
+  }
+  return { readySteps, waitingSteps };
 }
 
 function planHasCycle(steps) {
@@ -1265,6 +1460,12 @@ function testOutputFailed(response) {
   return /(?:^|\n)(?:not ok \d+\s+-|FAILED \([^\n)]*failures=[1-9]\d*|=+ .* [1-9]\d* failed|test result: FAILED|Tests:\s+.*[1-9]\d* failed|Tests run:.*Failures:\s*[1-9]\d*)/im.test(toolResponseText(response));
 }
 
+function testSetupFailed(response) {
+  return /(?:^|\n)(?:#\s*)?(?:Error(?:\s+\[ERR_MODULE_NOT_FOUND\])?:\s+Cannot find (?:module|package)|ModuleNotFoundError:|ImportError:)/im.test(
+    toolResponseText(response),
+  );
+}
+
 function shellSegments(command) {
   return command.split(/&&|\|\||[|;&\n]/).map((segment) => segment.trim()).filter(Boolean);
 }
@@ -1287,7 +1488,10 @@ function matchesIntegratedMerge(red, cwd) {
     || typeof red.integration.targetHead !== "string") return false;
   const result = git(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"]);
   if (!result.ok) return false;
-  const [, ...parents] = result.stdout.trim().split(/\s+/);
+  const [head, ...parents] = result.stdout.trim().split(/\s+/);
+  if (head === red.integration.sourceHead) {
+    return git(cwd, ["merge-base", "--is-ancestor", red.integration.targetHead, head]).ok;
+  }
   return parents.length === 2
     && parents[0] === red.integration.targetHead
     && parents[1] === red.integration.sourceHead;
