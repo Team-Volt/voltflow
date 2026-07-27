@@ -1448,7 +1448,7 @@ function hookWorkspace(input, context) {
 
 function isTestPath(file) {
   const normalized = file.replaceAll("\\", "/").toLowerCase();
-  return /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^/]+$/.test(normalized);
+  return /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|(?:^|\/)test_[^/]+\.py$|\.(?:test|spec)\.[^/]+$/.test(normalized);
 }
 
 function isTestCommand(command, response) {
