@@ -1833,7 +1833,7 @@ test("classification and a real RED precede production edits", () => {
   const testPatch = input("PreToolUse", {
     tool_name: "apply_patch",
     tool_input: {
-      command: "*** Begin Patch\n*** Add File: test/parser.test.mjs\n+assert.equal(parse('x'), true);\n*** End Patch",
+      command: "*** Begin Patch\n*** Add File: test_linekeep.py\n+assert parse('x')\n*** End Patch",
     },
   });
   assert.equal(handleHook(testPatch, fx.options), null);
