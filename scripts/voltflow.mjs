@@ -25,7 +25,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const TIERS = new Set(["trivial", "standard", "high"]);
 const TDD_MODES = new Set(["required", "exempt"]);
 const REVIEW_MODES = new Set(["self", "single", "split"]);
-const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "integrate", "plan", "review", "approve", "status"]);
+const MUTATING_COMMANDS = new Set(["start", "skip", "red", "validate", "integrate", "plan", "review", "approve"]);
 const SPLIT_LANES = new Set(["correctness-security", "validation-scope"]);
 const PLAN_STATUSES = new Set(["pending", "active", "done", "blocked"]);
 const REVIEW_RANK = { self: 0, single: 1, split: 2 };
@@ -123,6 +123,9 @@ export function runController(argv, options = {}) {
   const state = !historicalStatus && newerWorkflow(related, loaded)
     ? inheritedState(sessionId, cwd, related, currentFingerprint)
     : loaded ?? inheritedState(sessionId, cwd, related, currentFingerprint);
+  if (command === "status" && options.locked !== true && (state !== loaded || flags.agent !== undefined)) {
+    return withStateLock(dataDir, sessionId, () => runController(argv, { ...options, locked: true }));
+  }
 
   if (command === "start") {
     if (!TIERS.has(flags.tier) || !TDD_MODES.has(flags.tdd) || !REVIEW_MODES.has(flags.review)) {
