@@ -396,6 +396,31 @@ test("status persists an inherited worktree baseline", () => {
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).cwd, realpathSync(fx.worker));
 });
 
+test("read-only status does not create a lock or change state", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Inspect the workflow" }), fx.options);
+  start(fx);
+  const sessions = path.join(fx.dataDir, "sessions");
+  const stateFile = readdirSync(sessions).find((entry) => entry.endsWith(".json"));
+  assert.ok(stateFile);
+  const before = readFileSync(path.join(sessions, stateFile), "utf8");
+
+  chmodSync(sessions, 0o500);
+  let status;
+  try {
+    status = runController(
+      ["status", "--session", "session-1", "--workflow"],
+      { ...fx.options, cwd: "/repo" },
+    );
+  } finally {
+    chmodSync(sessions, 0o700);
+  }
+
+  assert.equal(status.exitCode, 0, status.stderr);
+  assert.equal(readFileSync(path.join(sessions, stateFile), "utf8"), before);
+  assert.deepEqual(readdirSync(sessions), [stateFile]);
+});
+
 test("workflow status shows ready plan steps and linked agent bindings", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
