@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
@@ -31,6 +32,7 @@ const PLAN_STATUSES = new Set(["pending", "active", "done", "blocked"]);
 const REVIEW_RANK = { self: 0, single: 1, split: 2 };
 const TIER_RANK = { trivial: 0, standard: 1, high: 2 };
 const REQUIRED_REVIEW = { trivial: "self", standard: "single", high: "split" };
+const PLANNING_DEPTH = { trivial: "inline", standard: "bounded", high: "thorough" };
 const VALUE_WARNING =
   "VoltFlow value check: You have reopened a validated diff twice. Stop searching for further imperfections. Continue only for a concrete, reproducible, material blocker to the user's requested outcome, a repository invariant, or a safety boundary; otherwise validate the current change once and finish.";
 const DEFAULT_DEPLOY_PATTERNS = [
@@ -63,6 +65,7 @@ const USAGE = [
   "red|validate: --evidence <text>",
   "integrate: --from <validated worker worktree>",
   "plan: --spec <JSON> | --step <JSON> | --result <JSON>",
+  "plan --spec: goal and 1-64 steps; each step needs id, action, dependsOn, lane, and stop",
   "status: [--agent <id>] [--workflow]",
   "review: --lane composite|correctness-security|validation-scope",
   "approve: --self --evidence <text>",
@@ -97,7 +100,7 @@ export function handleHook(input, options = {}) {
 
 export function runController(argv, options = {}) {
   const { command, flags } = parseArguments(argv);
-  if (["--help", "-h", "help"].includes(command)) return success(USAGE);
+  if ([command, argv[1]].some((token) => ["--help", "-h", "help"].includes(token))) return success(USAGE);
   const cwd = options.cwd ?? process.cwd();
   const dataDir = flags["data-dir"] ?? options.dataDir ?? process.env.PLUGIN_DATA ?? path.join(cwd, ".git", "voltflow");
   const sessionId = flags.session;
@@ -107,7 +110,7 @@ export function runController(argv, options = {}) {
     return failure("--session is required");
   }
   if (options.locked !== true && MUTATING_COMMANDS.has(command)) {
-    return withStateLock(dataDir, sessionId, () => runController(argv, { ...options, locked: true }));
+    return withStateLock(dataDir, sessionId, () => runController(argv, { ...options, locked: true }), options);
   }
   const currentFingerprint = fingerprint(cwd);
   const loaded = loadState(dataDir, sessionId, cwd);
@@ -124,7 +127,7 @@ export function runController(argv, options = {}) {
     ? inheritedState(sessionId, cwd, related, currentFingerprint)
     : loaded ?? inheritedState(sessionId, cwd, related, currentFingerprint);
   if (command === "status" && options.locked !== true && (state !== loaded || flags.agent !== undefined)) {
-    return withStateLock(dataDir, sessionId, () => runController(argv, { ...options, locked: true }));
+    return withStateLock(dataDir, sessionId, () => runController(argv, { ...options, locked: true }), options);
   }
 
   if (command === "start") {
@@ -269,7 +272,23 @@ export function runController(argv, options = {}) {
         ...spec,
         steps: spec.steps.map((step) => {
           const existing = existingSteps.get(step.id);
-          if (existing?.result === undefined) return step;
+          if (existing?.result === undefined) {
+            if (
+              existing?.status === "done"
+              && step.status === undefined
+              && step.evidence === undefined
+              && step.outcomes === undefined
+              && step.repeat === undefined
+              && step.when === undefined
+            ) {
+              return { ...step, status: existing.status, evidence: existing.evidence };
+            }
+            return step;
+          }
+          if (!step.outcomes?.includes(existing.result.outcome)) {
+            const { status: _status, evidence: _evidence, result: _result, ...reset } = step;
+            return reset;
+          }
           const revised = {
             ...step,
             evidence: existing.evidence,
@@ -306,7 +325,7 @@ export function runController(argv, options = {}) {
         step = { ...step, status: repeatRevisionStatus(existing, step) };
       }
       spec = {
-        goal: state.plan.goal,
+        ...state.plan,
         steps: existing === undefined
           ? [...state.plan.steps, step]
           : state.plan.steps.map((candidate) => candidate.id === step.id ? step : candidate),
@@ -323,8 +342,10 @@ export function runController(argv, options = {}) {
       const source = existing.when === undefined
         ? undefined
         : state.plan.steps.find((step) => step.id === existing.when.step);
+      const namedOutcome = existing.outcomes !== undefined;
       if (
-        !existing.outcomes?.includes(result.outcome)
+        namedOutcome && !existing.outcomes.includes(result.outcome)
+        || !namedOutcome && result.outcome !== undefined
         || ["done", "blocked"].includes(existing.status)
         || existing.dependsOn.some((id) => statuses.get(id) !== "done")
         || existing.when !== undefined && source?.result?.outcome !== existing.when.outcome
@@ -338,16 +359,22 @@ export function runController(argv, options = {}) {
         ...existing,
         status: complete ? "done" : attempt >= existing.repeat.max ? "blocked" : "pending",
         evidence: result.evidence,
-        result: { outcome: result.outcome, evidence: result.evidence, at: timestamp() },
+        ...(namedOutcome ? { result: { outcome: result.outcome, evidence: result.evidence, at: timestamp() } } : {}),
         ...(repeats ? { repeat: { ...existing.repeat, attempt: complete ? existing.repeat.attempt ?? 0 : attempt } } : {}),
       };
       spec = {
-        goal: state.plan.goal,
+        ...state.plan,
         steps: state.plan.steps.map((candidate) => candidate.id === step.id ? step : candidate),
       };
       if (!validPlan(spec, false)) return failure("plan --result would make the plan invalid");
     }
-    if (spec === null) return failure("plan requires a valid bounded --spec JSON value");
+    if (spec === null) {
+      return failure("plan --spec requires goal and 1-64 steps; each step needs id, action, dependsOn, lane, and stop");
+    }
+    if (!validPlan(spec, false)) return failure("plan --spec would make the plan invalid");
+    if (state.tier === "high" && !validThoroughPlan(spec)) {
+      return failure("high work requires a thorough plan with risks, mitigations, and acceptance checks");
+    }
     const peers = relatedStates(dataDir, sessionId, cwd).filter((peer) =>
       (peer.workflowId ?? peer.promptHash) === (state.workflowId ?? state.promptHash));
     const revision = Math.max(0, ...[state, ...peers].map((entry) => entry.plan?.revision ?? 0)) + 1;
@@ -438,8 +465,11 @@ export function isDeployInvocation(toolName, toolInput, cwd) {
   const command = commandFrom(toolInput);
   const config = loadProjectConfig(cwd);
   if (command !== null) {
-    for (const segment of shellSegments(command)) {
+    const segments = shellSegments(command);
+    for (const segment of segments) {
+      if (isControllerPlanSegment(segment)) continue;
       if (isDryRunSegment(segment)) continue;
+      if (segments.length === 1 && isReadOnlySearch(segment)) continue;
       if (DEFAULT_DEPLOY_PATTERNS.some((pattern) => pattern.test(segment))) return true;
       if (config.deployPatterns.some((pattern) => pattern.test(segment))) return true;
     }
@@ -597,7 +627,7 @@ function onUserPromptLocked(input, context) {
     `VoltFlow is active. Before editing, run ${prefix.replace("<command>", "start")} --tier <trivial|standard|high> --tdd <required|exempt> --review <self|single|split>. ` +
       `If the controller cannot access PLUGIN_DATA inside the sandbox, rerun the exact command with external permission; do not relocate the approval state. ` +
       `For a simple, low-risk edit with no deployment intent, replace start with skip and add --evidence <reason>; skip must happen before any change and does not approve deployment. ` +
-      `For standard or high work, after start succeeds run ${prefix.replace("<command>", "plan")} --spec <JSON> to store the bounded adaptive plan; revise it only when evidence changes the work. ` +
+      `Store a plan only when dependencies, parallel work, branches, or bounded retries make the graph useful; edits and review never require one. If a high workflow stores a plan, it must include risks with mitigations plus observable acceptance checks. Revise the plan only when evidence changes the work. ` +
       `Use ${prefix.replace("<command>", "plan")} --step <JSON> to update a single step, ${prefix.replace("<command>", "plan")} --result <JSON> to record a declared outcome, and ${prefix.replace("<command>", "status")} --workflow to see ready steps, waiting reasons, and linked worktrees. ` +
       `For manual evidence, replace start with red or validate and add --evidence <text>; self review uses approve --self --evidence <text>. ` +
       `Before an independent review, replace start with review and add --lane <lane>; give its returned token to the reviewer, whose final receipt must be VOLTFLOW_REVIEW: PASS|FAIL <lane> <token>. ` +
@@ -647,16 +677,6 @@ function onPreToolUse(input, context) {
   if (configError !== null && isCommandTool(input.tool_name)) {
     return deny(`VoltFlow configuration must be fixed before command execution: ${configError}`);
   }
-  if (
-    state?.active === true
-    && input.tool_name.endsWith("spawn_agent")
-    && isRecord(input.tool_input)
-    && typeof input.tool_input.task_name === "string"
-    && input.tool_input.fork_turns !== "none"
-  ) {
-    return deny('VoltFlow requires v2 subagents to use fork_turns: "none".');
-  }
-
   if (isDeployInvocation(input.tool_name, input.tool_input, workspace.cwd)) {
     if (state === null) return deny("VoltFlow blocked deployment: no workflow state or review receipt exists.");
     let gateState = state;
@@ -993,15 +1013,19 @@ function pendingReasons(state, currentFingerprint) {
 function workflowStatus(dataDir, sessionId, cwd, state, fingerprint) {
   const workflowId = state.workflowId ?? state.promptHash;
   const readiness = planReadiness(state.plan);
+  const registered = registeredWorktrees(cwd);
   return {
     workflowId,
     tier: state.tier,
+    planningDepth: state.plan === null ? "none" : PLANNING_DEPTH[state.tier] ?? "stored",
     tdd: state.tdd,
     reviewMode: state.reviewMode,
     plan: state.plan,
     ...readiness,
     worktrees: loadSessionStates(dataDir, sessionId)
-      .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId && sameRepository(entry.cwd, cwd))
+      .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId
+        && sameRepository(entry.cwd, cwd)
+        && (registered === null || registered.has(canonicalPath(entry.cwd))))
       .map((entry) => ({
         cwd: entry.cwd,
         agentIds: entry.agentIds ?? [],
@@ -1010,6 +1034,17 @@ function workflowStatus(dataDir, sessionId, cwd, state, fingerprint) {
         pending: pendingReasons(entry, fingerprint(entry.cwd)),
       })),
   };
+}
+
+function registeredWorktrees(cwd) {
+  const result = git(cwd, ["worktree", "list", "--porcelain"]);
+  if (!result.ok) return null;
+  return new Set(result.stdout.split(/\n\n+/).flatMap((block) => {
+    const lines = block.split("\n");
+    if (lines.some((line) => line.startsWith("prunable"))) return [];
+    const worktree = lines.find((line) => line.startsWith("worktree "));
+    return worktree === undefined ? [] : [canonicalPath(worktree.slice("worktree ".length))];
+  }));
 }
 
 function evidenceBlocker(state, currentFingerprint) {
@@ -1050,22 +1085,31 @@ function saveStartedState(dataDir, state) {
   }
 }
 
-function withStateLock(dataDir, sessionId, operation) {
+function withStateLock(dataDir, sessionId, operation, options = {}) {
   const lock = `${statePath(dataDir, sessionId)}.lock`;
   mkdirSync(path.dirname(lock), { recursive: true });
   const deadline = Date.now() + 5000;
+  const ownerId = randomUUID();
   let descriptor;
   while (descriptor === undefined) {
+    let recoveryClaim = null;
     try {
       descriptor = openSync(lock, "wx", 0o600);
+      writeFileSync(descriptor, JSON.stringify({ pid: process.pid, ownerId }));
     } catch (error) {
       if (!(error instanceof Error) || error.code !== "EEXIST") throw error;
       try {
-        if (Date.now() - statSync(lock).mtimeMs > 15000) unlinkSync(lock);
-      } catch {
+        recoveryClaim = recoverStaleLock(lock, options.beforeStaleLockRecovery, options.afterStaleLockClaim);
+      } catch (error) {
+        if (isStaleLockRecoveryUnavailable(error)) throw error;
         // Another hook released the lock between checks.
       }
-      if (Date.now() >= deadline) throw new Error("timed out waiting for the VoltFlow session lock");
+      if (Date.now() >= deadline) {
+        if (recoveryClaim) {
+          throw staleLockRecoveryUnavailable(`a recovery claim remained after waiting; verify no controller is recovering, then remove ${recoveryClaim} before retrying`);
+        }
+        throw new Error("timed out waiting for the VoltFlow session lock");
+      }
       // ponytail: synchronous per-session lock; use a transactional store if hook throughput grows.
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
@@ -1075,10 +1119,94 @@ function withStateLock(dataDir, sessionId, operation) {
   } finally {
     closeSync(descriptor);
     try {
-      unlinkSync(lock);
+      if (lockOwnedBy(lock, ownerId)) unlinkSync(lock);
     } catch {
       // A stale-lock recovery may already have removed it.
     }
+  }
+}
+
+function recoverStaleLock(lock, beforeRecovery, afterClaim) {
+  if (Date.now() - statSync(lock).mtimeMs <= 15000) return;
+  const contents = recoverableLockContents(lock);
+  if (contents === null) return;
+  beforeRecovery?.();
+  const recovery = `${lock}.${createHash("sha256").update(contents).digest("hex")}.recover`;
+  try {
+    linkSync(lock, recovery);
+  } catch (error) {
+    if (isRecord(error) && error.code === "EEXIST") {
+      if (sameLockFile(lock, recovery)) return recovery;
+      throw staleLockRecoveryUnavailable(`an incompatible recovery claim already exists at ${recovery}`);
+    }
+    if (isRecord(error) && error.code === "ENOENT") return false;
+    throw staleLockRecoveryUnavailable(`cannot link ${lock} to ${recovery}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    if (recoverableLockContents(recovery) !== contents) return false;
+    afterClaim?.();
+    if (!sameLockFile(lock, recovery)) return false;
+    unlinkSync(lock);
+  } finally {
+    try {
+      unlinkSync(recovery);
+    } catch {
+      // A stale-lock recovery may already have removed it.
+    }
+  }
+  return false;
+}
+
+function isStaleLockRecoveryUnavailable(error) {
+  return isRecord(error) && error.code === "VOLTFLOW_STALE_LOCK_RECOVERY_UNAVAILABLE";
+}
+
+function staleLockRecoveryUnavailable(reason) {
+  const error = new Error(`VoltFlow stale-lock recovery is unavailable: ${reason}`);
+  error.code = "VOLTFLOW_STALE_LOCK_RECOVERY_UNAVAILABLE";
+  return error;
+}
+
+function sameLockFile(left, right) {
+  try {
+    const leftStat = statSync(left);
+    const rightStat = statSync(right);
+    return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+  } catch {
+    return false;
+  }
+}
+
+function recoverableLockContents(lock) {
+  let contents;
+  try {
+    contents = readFileSync(lock, "utf8");
+  } catch {
+    return null;
+  }
+  let owner;
+  try {
+    owner = JSON.parse(contents);
+  } catch {
+    throw staleLockRecoveryUnavailable(`the stale lock metadata is empty or malformed; verify no controller is running, then remove ${lock} manually`);
+  }
+  if (!isRecord(owner) || !Number.isInteger(owner.pid) || owner.pid <= 0) {
+    throw staleLockRecoveryUnavailable(`the stale lock metadata has no owner PID; verify no controller is running, then remove ${lock} manually`);
+  }
+  try {
+    process.kill(owner.pid, 0);
+    return null;
+  } catch (error) {
+    return error instanceof Error && error.code === "ESRCH" ? contents : null;
+  }
+}
+
+function lockOwnedBy(lock, ownerId) {
+  try {
+    const owner = JSON.parse(readFileSync(lock, "utf8"));
+    return isRecord(owner) && owner.ownerId === ownerId;
+  } catch {
+    return false;
   }
 }
 
@@ -1192,7 +1320,7 @@ function parsePlanResult(value) {
     const result = JSON.parse(value);
     return isRecord(result)
       && typeof result.id === "string"
-      && validOutcomeName(result.outcome)
+      && (result.outcome === undefined || validOutcomeName(result.outcome))
       && textWithin(result.evidence, 2000)
       ? result
       : null;
@@ -1268,6 +1396,21 @@ function validPlan(value, stored = true) {
     && step.when !== undefined
     && steps.get(step.when.step)?.result?.outcome !== step.when.outcome)) return false;
   return !planHasCycle(value.steps);
+}
+
+function validThoroughPlan(value) {
+  return isRecord(value)
+    && Array.isArray(value.risks)
+    && value.risks.length >= 1
+    && value.risks.length <= 16
+    && value.risks.every((entry) =>
+      isRecord(entry)
+      && textWithin(entry.risk, 1000)
+      && textWithin(entry.mitigation, 1000))
+    && Array.isArray(value.acceptance)
+    && value.acceptance.length >= 1
+    && value.acceptance.length <= 32
+    && value.acceptance.every((entry) => textWithin(entry, 1000));
 }
 
 function validRepeat(value) {
@@ -1479,7 +1622,7 @@ function toolResponseText(response) {
 }
 
 function testOutputFailed(response) {
-  return /(?:^|\n)(?:not ok \d+\s+-|FAILED \([^\n)]*failures=[1-9]\d*|=+ .* [1-9]\d* failed|test result: FAILED|Tests:\s+.*[1-9]\d* failed|Tests run:.*Failures:\s*[1-9]\d*)/im.test(toolResponseText(response));
+  return /(?:^|\n)(?:not ok \d+\s+-|FAILED \([^\n)]*failures=[1-9]\d*|=+ .* [1-9]\d* failed|test result: FAILED|Tests:\s+.*[1-9]\d* failed|Tests run:.*Failures:\s*[1-9]\d*|ℹ\s+fail\s+[1-9]\d*)/im.test(toolResponseText(response));
 }
 
 function testSetupFailed(response) {
@@ -1489,7 +1632,72 @@ function testSetupFailed(response) {
 }
 
 function shellSegments(command) {
-  return command.split(/&&|\|\||[|;&\n]/).map((segment) => segment.trim()).filter(Boolean);
+  const segments = [];
+  let start = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (escaped) {
+      escaped = false;
+    } else if (character === "\\" && quote !== "'") {
+      escaped = true;
+    } else if (quote !== null) {
+      if (character === quote) quote = null;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if ("|;&\n".includes(character)) {
+      segments.push(command.slice(start, index).trim());
+      if ((character === "|" || character === "&") && command[index + 1] === character) index += 1;
+      start = index + 1;
+    }
+  }
+  segments.push(command.slice(start).trim());
+  return segments.filter(Boolean);
+}
+
+function isReadOnlySearch(segment) {
+  if (hasShellExecutionExpansion(segment)) return false;
+  const words = segment.split(/\s+/);
+  const offset = words[0] === "rtk" ? words[1] === "proxy" ? 2 : 1 : 0;
+  const command = words[offset];
+  return ["rg", "grep"].includes(command)
+    && !(command === "rg" && words.slice(offset + 1).some((word) => word === "--pre" || word.startsWith("--pre=")));
+}
+
+function isControllerPlanSegment(segment) {
+  return !hasShellExecutionExpansion(segment)
+    && /^(?:rtk\s+(?:proxy\s+)?)?(?:\S*[\\/])?node(?:\.exe)?\s+(?:"[^"]*voltflow\.mjs"|'[^']*voltflow\.mjs'|\S*voltflow\.mjs)\s+plan(?:\s|$)/i.test(segment);
+}
+
+function hasShellExecutionExpansion(segment) {
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < segment.length; index += 1) {
+    const character = segment[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (character === "'" && quote === null) {
+      quote = "'";
+      continue;
+    }
+    if (character === '"') {
+      quote = quote === '"' ? null : quote === null ? '"' : quote;
+      continue;
+    }
+    if (character === "`" || "<$>=".includes(character) && segment[index + 1] === "(") return true;
+  }
+  return false;
 }
 
 function isGitMetadataCommand(command) {

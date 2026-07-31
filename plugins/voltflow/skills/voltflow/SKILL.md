@@ -17,19 +17,30 @@ Otherwise choose one tier:
 
 - `trivial`: one obvious location, no behavioral ambiguity, low blast radius. Use an inline intent, no planner, and self-review.
 - `standard`: a bounded feature or fix across established layers. Use a short checklist and one composite reviewer when code changes.
-- `high`: architecture, auth, security, migration, concurrency, destructive data work, or several coupled slices. Use a planning subagent only if discovery leaves real design uncertainty, then use two independent review lanes.
+- `high`: architecture, auth, security, migration, concurrency, destructive data work, or coupled slices whose order, rollback, or validation needs design. Use a planning subagent only if discovery leaves real design uncertainty, then use two independent review lanes.
 
 Classify TDD as `required` for observable behavior and `exempt` for prose, generated output, metadata-only edits, or changes with no executable seam. An exemption still needs the closest useful validation; never create a fake text-presence test.
 
 Start the controller with `review=self` for trivial, `review=single` for standard, and `review=split` for high. Upgrade when discovery reveals more risk; do not downgrade to avoid a gate.
 
-## Build and revise the adaptive plan
+## Use an adaptive plan only when it helps
 
-After starting standard or high work, store a plan with the controller's `plan --spec <JSON>` command. The parent agent owns this workflow-wide record:
+The main agent decides whether a stored plan will make the work clearer. Most trivial and standard tasks need only an inline intent or short checklist. Store a plan when dependencies, parallel lanes, conditional branches, or bounded retries are useful enough to justify the bookkeeping. The controller never requires a plan before edits or review.
+
+The main agent may write the plan itself. Delegate planning only when a separate pass adds real value after discovery. When an external planner is useful, route it to `gpt-5.6-sol` at an effort suited to the ambiguity and risk; do not spawn one merely because the workflow is standard or high. A high-tier stored plan adds risks with mitigations and observable acceptance checks:
 
 ```json
 {
   "goal": "Ship the requested behavior",
+  "risks": [
+    {
+      "risk": "Existing callers may regress",
+      "mitigation": "Run focused and regression checks"
+    }
+  ],
+  "acceptance": [
+    "The requested behavior and existing callers pass their checks"
+  ],
   "steps": [
     {
       "id": "implement",
@@ -51,6 +62,8 @@ After starting standard or high work, store a plan with the controller's `plan -
 }
 ```
 
+Standard plans may omit `risks` and `acceptance`. When a high workflow uses a stored plan, it must include at least one of each; the controller rejects a shallow high plan.
+
 Steps with satisfied dependencies can run in parallel. `lane` groups related work; it does not cap concurrency. Size each wave to the useful independent slices and the host's capacity, using the existing routing rules without adding a separate cost policy.
 
 Use named outcomes when later work depends on how a step finished:
@@ -65,7 +78,7 @@ Use named outcomes when later work depends on how a step finished:
 }
 ```
 
-Record a declared outcome with `plan --result '{"id":"review","outcome":"pass","evidence":"Review passed"}'`. A normal result completes the step. A non-matching repeat result increments its attempt and makes it ready again, or blocks it at `repeat.max`.
+Record a declared outcome with `plan --result '{"id":"review","outcome":"pass","evidence":"Review passed"}'`. For a plain step without named outcomes, omit `outcome`. A normal result completes the step. A non-matching repeat result increments its attempt and makes it ready again, or blocks it at `repeat.max`.
 
 Revise the plan only when evidence changes the work. Use `plan --step <JSON>` for a single step; it patches an existing step or adds a complete new one, validates the whole plan, increments the revision, and updates linked worktrees. Result state belongs to the controller and cannot be changed through `plan --step`. Use `plan --spec <JSON>` only when the goal or several steps change together. A failed test adds or activates the smallest fix step. Older plans without named outcomes keep their current behavior.
 
@@ -87,7 +100,7 @@ Complete this loop for every TDD-required slice:
 
 Before writing, name the owned paths and expected observable. Do not perform adjacent cleanup, introduce a dependency that the standard library or platform replaces, or add an abstraction with one foreseeable implementation.
 
-Record successful automated or manual validation with the controller. A passing command from before the final edit is stale evidence. Exercise every changed observable layer: a syntax check proves syntax, not browser behavior. When user-facing web files change, run one real browser path at a supported viewport, or report that claim as pending when no browser runtime is available.
+Directly executed passing test commands are recorded automatically. Use `validate` only for manual checks or when status shows that the hook could not capture automation. A passing command from before the final edit is stale evidence. Exercise every changed observable layer: a syntax check proves syntax, not browser behavior. When user-facing web files change, run one real browser path at a supported viewport, or report that claim as pending when no browser runtime is available.
 
 ## Delegate only useful parallel work
 
@@ -97,7 +110,9 @@ The `SubagentStart` hook supplies the exact controller prefix, including protect
 
 Before merging a worker commit, run `integrate --from <worker-worktree>` from the integration worktree. It adopts evidence only from a linked worktree in the same workflow with current validation and no TDD violation; the merge then invalidates validation and review normally, so validate and review the integrated result.
 
-When the active spawn schema is v2, always set `fork_turns: "none"`. Never use full-history inheritance, including when overriding `model` or `reasoning_effort`.
+Choose subagent context with the assignment. Implementation, validation, and review usually need isolation. An external planner may receive the last 10 turns when recent decisions matter; the explicit assignment must still contain the goal, scope, evidence, and stop condition.
+
+When the active schema exposes `gpt-5.6-luna` with `max` reasoning, consider it for bounded implementation work whose result has fast, deterministic checks. This is a cost option, not a capability claim. Keep planning, high-risk ambiguity, security boundaries, migrations, concurrency, and destructive work on the strongest suitable route. If Luna writes code, require the same RED, validation, and review evidence as any other worker.
 
 Never select `ultra` reasoning for a subagent. Do not use a pinned profile or inherit the parent unless its effort is known and not `ultra`; refuse the spawn when no compliant route exists. If the user explicitly requests `ultra`, report the policy conflict instead of substituting another effort.
 
