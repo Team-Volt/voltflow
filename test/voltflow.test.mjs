@@ -628,6 +628,51 @@ test("plan spec revisions preserve completed plain steps across linked worktrees
   assert.equal(reset.evidence, undefined);
 });
 
+test("incompatible named-outcome plan revisions reset stale results", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Revise an outcome plan" }), fx.options);
+  start(fx);
+  const spec = {
+    goal: "Complete the classified task",
+    steps: [{
+      id: "classify",
+      action: "Classify it",
+      dependsOn: [],
+      lane: "analysis",
+      stop: "Return A or B",
+      outcomes: ["A", "B"],
+    }],
+  };
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--result", JSON.stringify({
+      id: "classify",
+      outcome: "A",
+      evidence: "Classifier returned A",
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+
+  const revised = runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      ...spec,
+      steps: [{ ...spec.steps[0], outcomes: ["B"] }],
+    })],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(revised.exitCode, 0, revised.stderr);
+  const state = loadState(fx.dataDir, "session-1");
+  assert.notEqual(state, null);
+  const step = state.plan.steps[0];
+  assert.deepEqual(step.outcomes, ["B"]);
+  assert.equal(step.status, undefined);
+  assert.equal(step.evidence, undefined);
+  assert.equal(step.result, undefined);
+});
+
 test("a worker binds to its worktree on first routed tool use", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);

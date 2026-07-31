@@ -285,6 +285,10 @@ export function runController(argv, options = {}) {
             }
             return step;
           }
+          if (!step.outcomes?.includes(existing.result.outcome)) {
+            const { status: _status, evidence: _evidence, result: _result, ...reset } = step;
+            return reset;
+          }
           const revised = {
             ...step,
             evidence: existing.evidence,
@@ -367,6 +371,7 @@ export function runController(argv, options = {}) {
     if (spec === null) {
       return failure("plan --spec requires goal and 1-64 steps; each step needs id, action, dependsOn, lane, and stop");
     }
+    if (!validPlan(spec, false)) return failure("plan --spec would make the plan invalid");
     if (state.tier === "high" && !validThoroughPlan(spec)) {
       return failure("high work requires a thorough plan with risks, mitigations, and acceptance checks");
     }
