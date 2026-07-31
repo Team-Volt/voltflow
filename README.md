@@ -28,8 +28,8 @@ Before the first edit, the agent selects a risk tier, TDD mode, and review mode.
 | Tier | Typical use | Planning | Minimum review |
 | --- | --- | --- | --- |
 | `trivial` | One obvious, low-risk change | Inline intent | Self-review |
-| `standard` | A bounded feature or fix | Adaptive plan | One composite reviewer |
-| `high` | Security, migration, concurrency, destructive data work, or several coupled parts | Adaptive plan | Two independent review lanes |
+| `standard` | A bounded feature or fix | Short checklist; optional graph | One composite reviewer |
+| `high` | Security, migration, concurrency, destructive data work, or coupled parts whose order or rollback needs design | Thorough graph when useful | Two independent review lanes |
 
 An active workflow can move to a higher tier. It cannot move to a weaker tier or review mode to avoid a gate.
 
@@ -40,9 +40,13 @@ TDD is classified separately:
 
 A simple, low-risk task with no executable behavior or deployment intent can use `skip` before any change. Skipping removes the workflow checks for that prompt, but it never grants deployment approval.
 
-### 2. Plan in proportion to risk
+### 2. Plan only when it helps
 
-Standard and high workflows store an adaptive plan in protected session state. A plan can describe dependencies, parallel lanes, stop conditions, named outcomes, conditional branches, and capped repeats. `status --workflow` reports ready steps, waiting steps, and linked worktrees with their agent bindings and missing evidence.
+The agent decides whether to keep an inline checklist or store a dynamic plan. A stored plan helps when work has dependencies, parallel lanes, conditional branches, or capped retries. VoltFlow does not require one before edits or review.
+
+The main agent can write the plan. It may call a separate Sol planner when discovery leaves enough uncertainty to justify the handoff. High-tier stored plans include risks, mitigations, and observable acceptance checks.
+
+Stored plans can describe dependencies, parallel lanes, stop conditions, named outcomes, conditional branches, and capped repeats. `status --workflow` reports ready steps, waiting steps, and linked worktrees with their agent bindings and missing evidence. Plain steps finish with evidence alone; named outcomes are needed only for branches and outcome-driven retries.
 
 The plan is coordination data. It does not run commands, create worktrees, approve a review, or bypass any gate. The agent performs those actions.
 
@@ -137,7 +141,9 @@ VoltFlow is a guardrail around an agent-run engineering process. It is not a CI 
 
 ## Install
 
-VoltFlow requires Node.js 20 or newer and Git.
+VoltFlow requires Node.js 20 or newer and Git. Stale-lock recovery uses Node's atomic hard-link operation on Windows, Linux, and macOS. It reclaims only structured lock metadata whose owner PID is proven dead.
+
+If the filesystem does not support hard links, a recovery claim is incompatible or persistent, or lock metadata is empty, malformed, or lacks a PID, VoltFlow fails closed with a clear manual-recovery error. Verify that no controller still runs, then remove the named lock or `.recover` file before retrying.
 
 Add the Team Volt marketplace and install the plugin:
 
@@ -227,9 +233,17 @@ hide_spawn_agent_metadata = false
 tool_namespace = "agents"
 ```
 
-Remove a top-level `model_catalog_json` entry if it points to a v1 catalog, then restart Codex and open a new task. VoltFlow requires v2 subagents to use `fork_turns: "none"` so explicit model and reasoning settings remain valid.
+VoltFlow reads the live spawn schema instead of assuming a model is installed. When that schema exposes `gpt-5.6-luna` with `max` reasoning, the agent may use Luna max for bounded implementation work with fast deterministic checks. Planning and high-risk work stay on the strongest suitable route.
 
-The full routing rules are in [skills/voltflow/references/routing.md](skills/voltflow/references/routing.md).
+Some Codex catalogs still mark Luna as multi-agent v1. To expose it to the v2 spawn tool, copy the active model catalog, change only Luna's `multi_agent_version` to `"v2"`, set the copied file in `config.toml`, then restart Codex:
+
+```toml
+model_catalog_json = "/absolute/path/to/copied-model-catalog.json"
+```
+
+Do not edit Codex's cache in place; a refresh can replace it. Check the effective catalog after restart before relying on the route.
+
+The full routing rules are in [plugins/voltflow/skills/voltflow/references/routing.md](plugins/voltflow/skills/voltflow/references/routing.md).
 
 ## Development
 

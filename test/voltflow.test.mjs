@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,7 +12,7 @@ import {
   loadState,
   runController,
   workspaceFingerprint,
-} from "../scripts/voltflow.mjs";
+} from "../plugins/voltflow/scripts/voltflow.mjs";
 
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "voltflow-test-"));
@@ -74,6 +74,32 @@ function start(fx, { tier = "standard", tdd = "required", review = "single" } = 
       review,
     ],
     { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  if (tier === "high") storeThoroughPlan(fx);
+}
+
+function thoroughPlan(spec = {}) {
+  return {
+    goal: "Complete the high-risk test workflow",
+    risks: [{ risk: "The workflow may regress", mitigation: "Run the focused test" }],
+    acceptance: ["The focused test passes"],
+    steps: [{
+      id: "test-work",
+      action: "Exercise the requested workflow",
+      dependsOn: [],
+      lane: "test",
+      stop: "The focused test passes",
+      status: "pending",
+    }],
+    ...spec,
+  };
+}
+
+function storeThoroughPlan(fx, { cwd = "/repo", session = "session-1", spec } = {}) {
+  const result = runController(
+    ["plan", "--session", session, "--spec", JSON.stringify(thoroughPlan(spec))],
+    { ...fx.options, cwd },
   );
   assert.equal(result.exitCode, 0, result.stderr);
 }
@@ -172,7 +198,9 @@ test("prompt injection starts session state and names the exact controller", () 
   assert.match(output.hookSpecificOutput.additionalContext, /follow up.*error.*exceeds.*stop condition/i);
   assert.match(output.hookSpecificOutput.additionalContext, /interrupt.*blocking completion.*follow-up.*did not recover/i);
   assert.match(output.hookSpecificOutput.additionalContext, /create.*linked worktree.*before.*parallel writer/i);
-  assert.match(output.hookSpecificOutput.additionalContext, /standard or high.*after start succeeds.*plan.*--spec/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /store a plan only when.*dependencies.*parallel.*branches.*retries/i);
+  assert.match(output.hookSpecificOutput.additionalContext, /if a high workflow stores a plan.*risks.*mitigations.*acceptance/i);
+  assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /standard or high.*after start succeeds.*plan.*--spec/i);
   assert.match(output.hookSpecificOutput.additionalContext, /evidence changes/i);
   assert.match(output.hookSpecificOutput.additionalContext, /plan.*--step.*single step/i);
   assert.match(output.hookSpecificOutput.additionalContext, /status.*--workflow.*ready steps.*worktrees/i);
@@ -329,21 +357,22 @@ test("subagent contract limits per-slice TDD to required work", () => {
   assert.match(context, /exact controller state or tool output/i);
 });
 
-test("active v2 spawns require isolated context", () => {
+test("subagent model, reasoning, and context remain agent-owned", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Implement the parser" }), fx.options);
+  start(fx);
   const spawn = (toolInput) => handleHook(
     input("PreToolUse", { tool_name: "agentsspawn_agent", tool_input: toolInput }),
     fx.options,
   );
 
-  assert.equal(spawn({ task_name: "worker", message: "work", fork_turns: "all" }).hookSpecificOutput.permissionDecision, "deny");
-  assert.equal(spawn({ task_name: "worker", message: "work" }).hookSpecificOutput.permissionDecision, "deny");
-  assert.equal(spawn({ task_name: "worker", message: "work", fork_turns: "none" }), null);
+  assert.equal(spawn({ task_name: "implementation", message: "work", model: "gpt-5.6-luna", reasoning_effort: "max", fork_turns: "none" }), null);
+  assert.equal(spawn({ task_name: "planner", message: "plan", model: "gpt-5.6-sol", reasoning_effort: "high", fork_turns: "10" }), null);
+  assert.equal(spawn({ task_name: "worker", message: "work", fork_turns: "all" }), null);
   assert.equal(handleHook(
     input("PreToolUse", {
       tool_name: "multi_agent_v1.spawn_agent",
-      tool_input: { message: "work", fork_context: false },
+      tool_input: { message: "plan", model: "gpt-5.6-sol", reasoning_effort: "high", fork_context: true },
     }),
     fx.options,
   ), null);
@@ -356,6 +385,7 @@ test("linked worktrees inherit isolated workflow state from an active session", 
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
 
   assert.equal(handleHook(input("PreToolUse", {
     cwd: fx.root,
@@ -429,7 +459,7 @@ test("workflow status shows ready plan steps and linked agent bindings", () => {
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
   assert.equal(runController(
-    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(thoroughPlan({
       goal: "Ship parallel work",
       steps: [
         { id: "code", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes", status: "active" },
@@ -438,7 +468,7 @@ test("workflow status shows ready plan steps and linked agent bindings", () => {
         { id: "paused", action: "Cannot proceed", dependsOn: [], lane: "code", stop: "Blocked", status: "blocked", evidence: "Waiting on access" },
         { id: "review", action: "Review it", dependsOn: ["code", "docs"], lane: "review", stop: "Review passes" },
       ],
-    })],
+    }))],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
   assert.equal(runController(
@@ -457,6 +487,59 @@ test("workflow status shows ready plan steps and linked agent bindings", () => {
   assert.equal(workflow.worktrees.length, 2);
   assert.deepEqual(workflow.worktrees.find((entry) => entry.cwd === realpathSync(fx.worker)).agentIds, ["worker-1"]);
   assert.ok(workflow.worktrees.every((entry) => Array.isArray(entry.pending)));
+});
+
+test("high workflows may edit and review without a stored plan", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement a cross-cutting change" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "exempt", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const edit = handleHook({ ...productionPatch(), cwd: fx.root }, fx.options);
+  assert.equal(edit, null);
+
+  const status = JSON.parse(runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: fx.root },
+  ).stdout);
+  assert.equal(status.plan, null);
+  assert.equal(status.planningDepth, "none");
+  assert.ok(status.worktrees[0].pending.every((reason) => !/plan.*missing/i.test(reason)));
+
+  assert.equal(runController(
+    ["validate", "--session", "session-1", "--evidence", "manual validation"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const review = runController(
+    ["review", "--session", "session-1", "--lane", "correctness-security"],
+    { ...fx.options, cwd: fx.root },
+  );
+  assert.equal(review.exitCode, 0, review.stderr);
+});
+
+test("plain plan steps finish without a named outcome", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Track a short optional plan" }), fx.options);
+  start(fx, { plan: false });
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Finish the bounded task",
+      steps: [{ id: "build", action: "Build it", dependsOn: [], lane: "code", stop: "Build passes" }],
+    })],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 0);
+
+  const result = runController(
+    ["plan", "--session", "session-1", "--result", JSON.stringify({ id: "build", evidence: "Build passed" })],
+    { ...fx.options, cwd: "/repo" },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  const step = loadState(fx.dataDir, "session-1").plan.steps[0];
+  assert.equal(step.status, "done");
+  assert.equal(step.evidence, "Build passed");
+  assert.equal(step.result, undefined);
 });
 
 test("a worker binds to its worktree on first routed tool use", () => {
@@ -564,6 +647,64 @@ test("adaptive plans are stored in protected state and revised in place", () => 
   }
 });
 
+test("invalid plans report the required base shape", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Plan a bounded parser fix" }), fx.options);
+  start(fx);
+  const result = runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      goal: "Fix the parser",
+      steps: [{ id: "fix", title: "Fix it", kind: "implementation" }],
+    })],
+    { ...fx.options, cwd: "/repo" },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /goal.*steps.*id.*action.*dependsOn.*lane.*stop/i);
+});
+
+test("high stored plans require risks and acceptance", () => {
+  const shallow = {
+    goal: "Ship the change",
+    steps: [{
+      id: "implement",
+      action: "Implement it",
+      dependsOn: [],
+      lane: "code",
+      stop: "The focused check passes",
+      status: "pending",
+    }],
+  };
+
+  const standard = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement a bounded change" }), standard.options);
+  start(standard);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(shallow)],
+    { ...standard.options, cwd: "/repo" },
+  ).exitCode, 0);
+
+  const high = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement a cross-cutting migration" }), high.options);
+  start(high, { tier: "high", review: "split" });
+  const rejected = runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(shallow)],
+    { ...high.options, cwd: "/repo" },
+  );
+  assert.equal(rejected.exitCode, 1);
+  assert.match(rejected.stderr, /high.*risks.*acceptance/i);
+
+  const thorough = runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify({
+      ...shallow,
+      risks: [{ risk: "Old sessions may fail", mitigation: "Keep both keys during overlap" }],
+      acceptance: ["Old and new sessions both verify during overlap"],
+    })],
+    { ...high.options, cwd: "/repo" },
+  );
+  assert.equal(thorough.exitCode, 0, thorough.stderr);
+});
+
 test("adaptive plans validate conditional outcomes and repeat targets", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Implement conditional workflow steps" }), fx.options);
@@ -622,7 +763,7 @@ test("plan results atomically record outcomes across linked worktrees", () => {
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
-  const spec = {
+  const spec = thoroughPlan({
     goal: "Handle the classified task",
     steps: [
       {
@@ -642,7 +783,7 @@ test("plan results atomically record outcomes across linked worktrees", () => {
         stop: "Finish",
       },
     ],
-  };
+  });
   assert.equal(runController(
     ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
     { ...fx.options, cwd: fx.root },
@@ -1029,6 +1170,44 @@ test("plan results reject unsafe state changes and preserve legacy readiness", (
   );
 });
 
+test("plan mutations preserve thorough planning metadata", () => {
+  const spec = {
+    goal: "Ship a safe migration",
+    risks: [{ risk: "Old sessions may fail", mitigation: "Keep both keys during the overlap" }],
+    acceptance: ["Old and new sessions both verify during the overlap"],
+    steps: [{
+      id: "build",
+      action: "Implement the migration",
+      dependsOn: [],
+      lane: "code",
+      stop: "Migration checks pass",
+      outcomes: ["pass"],
+    }],
+  };
+
+  for (const mutation of [
+    ["--step", { id: "build", action: "Implement the compatible migration" }],
+    ["--result", { id: "build", outcome: "pass", evidence: "Migration checks passed" }],
+  ]) {
+    const fx = fixture();
+    handleHook(input("UserPromptSubmit", { prompt: "Implement the migration" }), fx.options);
+    start(fx, { tier: "high", review: "split" });
+    assert.equal(runController(
+      ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+      { ...fx.options, cwd: "/repo" },
+    ).exitCode, 0);
+
+    const revised = runController(
+      ["plan", "--session", "session-1", mutation[0], JSON.stringify(mutation[1])],
+      { ...fx.options, cwd: "/repo" },
+    );
+    assert.equal(revised.exitCode, 0, revised.stderr);
+    const plan = loadState(fx.dataDir, "session-1").plan;
+    assert.deepEqual(plan.risks, spec.risks);
+    assert.deepEqual(plan.acceptance, spec.acceptance);
+  }
+});
+
 test("adaptive plans can revise one step without reposting the full plan", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Implement the parser" }), fx.options);
@@ -1115,13 +1294,13 @@ test("adaptive plan revisions propagate across linked worktrees", () => {
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
-  const spec = {
+  const spec = thoroughPlan({
     goal: "Ship parallel work",
     steps: [
       { id: "code", action: "Implement it", dependsOn: [], lane: "code", stop: "Focused test passes" },
       { id: "docs", action: "Document it", dependsOn: [], lane: "docs", stop: "Docs match behavior" },
     ],
-  };
+  });
 
   assert.equal(runController(
     ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
@@ -1271,6 +1450,7 @@ test("validated worker evidence can be adopted before an integration merge", () 
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
   assert.equal(runController(
     ["red", "--session", "session-1", "--evidence", "focused worker regression failed"],
     { ...fx.options, cwd: fx.worker },
@@ -1312,6 +1492,7 @@ test("validated worker evidence accepts an exact fast-forward merge", () => {
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
   assert.equal(runController(
     ["red", "--session", "session-1", "--evidence", "focused worker regression failed"],
     { ...fx.options, cwd: fx.worker },
@@ -1369,6 +1550,7 @@ test("integrated RED evidence cannot approve a different worker merge", () => {
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
   assert.equal(runController(
     ["red", "--session", "session-1", "--evidence", "focused worker regression failed"],
     { ...fx.options, cwd: fx.worker },
@@ -1409,6 +1591,7 @@ test("integration rejects stale worker validation", () => {
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
   assert.equal(runController(
     ["red", "--session", "session-1", "--evidence", "focused worker regression failed"],
     { ...fx.options, cwd: fx.worker },
@@ -1522,6 +1705,7 @@ test("an external symlink alias cannot bypass managed repository checks", () => 
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
 
   const result = handleHook(input("PreToolUse", {
     cwd: fx.root,
@@ -1541,6 +1725,7 @@ test("an external file symlink cannot bypass managed repository checks", () => {
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
 
   const result = handleHook(input("PreToolUse", {
     cwd: fx.root,
@@ -1564,6 +1749,7 @@ test("a managed symlink pointing outside cannot bypass repository checks", () =>
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
 
   const result = handleHook(input("PreToolUse", {
     cwd: fx.root,
@@ -1581,6 +1767,7 @@ test("review receipts route to their assigned worktree state", () => {
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
   handleHook(input("PreToolUse", {
     cwd: fx.root,
     tool_name: "apply_patch",
@@ -1697,6 +1884,7 @@ test("a live review receipt can retry after generated artifacts are removed", as
     ["start", "--session", "session-1", "--tier", "high", "--tdd", "exempt", "--review", "split"],
     { ...fx.options, cwd: fx.root },
   ).exitCode, 0);
+  storeThoroughPlan(fx, { cwd: fx.root });
   assert.equal(runController(
     ["validate", "--session", "session-1", "--evidence", "checks passed"],
     { ...fx.options, cwd: fx.worker },
@@ -1992,6 +2180,39 @@ test("deployment detection covers defaults and project matchers", () => {
   assert.equal(isDeployInvocation("mcp__cloud__promote", {}, fx.root), true);
 });
 
+test("read-only searches can contain deployment command text", () => {
+  const fx = fixture();
+  assert.equal(isDeployInvocation("Bash", { command: "rg 'npm run deploy' README.md" }, fx.root), false);
+  assert.equal(isDeployInvocation("Bash", { command: "rtk rg 'terraform apply' scripts" }, fx.root), false);
+  assert.equal(isDeployInvocation("Bash", { command: "rg 'npm run deploy' deploy.sh | sh" }, fx.root), true);
+  assert.equal(isDeployInvocation("Bash", { command: "echo $(npm run deploy)" }, fx.root), true);
+});
+
+test("controller plan commands can describe deployment work", () => {
+  const fx = fixture();
+  assert.equal(isDeployInvocation("Bash", {
+    command: "node '/plugin/scripts/voltflow.mjs' plan --spec '{\"acceptance\":[\"Do not run npm run deploy\"]}'",
+  }, fx.root), false);
+  assert.equal(isDeployInvocation("Bash", {
+    command: "node '/plugin/scripts/voltflow.mjs' plan --spec '{\"acceptance\":[\"Document `npm run deploy`, $(npm run deploy), and <(npm run deploy)\"]}'",
+  }, fx.root), false);
+  assert.equal(isDeployInvocation("Bash", {
+    command: "node '/plugin/scripts/voltflow.mjs' plan --spec '{}' && npm run deploy",
+  }, fx.root), true);
+  assert.equal(isDeployInvocation("Bash", {
+    command: `node '/plugin/scripts/voltflow.mjs' plan --spec "$(npm run deploy)"`,
+  }, fx.root), true);
+  assert.equal(isDeployInvocation("Bash", {
+    command: "node '/plugin/scripts/voltflow.mjs' plan --spec `npm run deploy`",
+  }, fx.root), true);
+  assert.equal(isDeployInvocation("Bash", {
+    command: "node '/plugin/scripts/voltflow.mjs' plan --spec <(npm run deploy)",
+  }, fx.root), true);
+  assert.equal(isDeployInvocation("Bash", {
+    command: "node '/plugin/scripts/voltflow.mjs' plan --spec >(npm run deploy)",
+  }, fx.root), true);
+});
+
 test("incomplete Stop reports pending evidence without replacing the response", () => {
   const fx = fixture();
   handleHook(input("UserPromptSubmit", { prompt: "Fix the parser" }), fx.options);
@@ -2209,11 +2430,21 @@ test("an explicit start on a new prompt replaces the prior workflow", () => {
   assert.equal(loadState(fx.dataDir, "session-1").tdd, "required");
 });
 
-test("controller help lists the workflow commands", () => {
+test("controller help lists commands and supports command-specific help", () => {
+  const fx = fixture();
   const result = runController(["--help"]);
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /start\|skip\|red\|validate\|integrate\|plan\|review\|approve\|status\|gate/);
   assert.match(result.stdout, /plan: --spec <JSON> \| --step <JSON> \| --result <JSON>/);
+
+  const plan = runController(["plan", "--help"]);
+  assert.equal(plan.exitCode, 0);
+  assert.match(plan.stdout, /goal.*steps.*id.*action.*dependsOn.*lane.*stop/i);
+
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", "help"],
+    { ...fx.options, cwd: "/repo" },
+  ).exitCode, 1);
 });
 
 function productionPatchDecision(fx) {
@@ -2234,6 +2465,24 @@ test("risk tiers enforce their review mode and cannot be downgraded", () => {
     { ...fx.options, cwd: "/repo" },
   );
   assert.equal(downgrade.exitCode, 1);
+});
+
+test("workflow status reports stored planning depth only when a plan exists", () => {
+  for (const [tier, reviewMode, planningDepth] of [
+    ["trivial", "self", "none"],
+    ["standard", "single", "none"],
+    ["high", "split", "thorough"],
+  ]) {
+    const fx = fixture();
+    handleHook(input("UserPromptSubmit", { prompt: "Plan the work" }), fx.options);
+    start(fx, { tier, review: reviewMode });
+    const status = runController(
+      ["status", "--session", "session-1", "--workflow"],
+      { ...fx.options, cwd: "/repo" },
+    );
+    assert.equal(status.exitCode, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).planningDepth, planningDepth);
+  }
 });
 
 test("restarting or upgrading an active workflow preserves TDD violations", () => {
@@ -2644,6 +2893,10 @@ test("concurrent split reviews retain both receipts", async () => {
     { dataDir, cwd: root },
   ).exitCode, 0);
   assert.equal(runController(
+    ["plan", "--session", "parallel", "--spec", JSON.stringify(thoroughPlan())],
+    { dataDir, cwd: root },
+  ).exitCode, 0);
+  assert.equal(runController(
     ["validate", "--session", "parallel", "--evidence", "checks passed"],
     { dataDir, cwd: root },
   ).exitCode, 0);
@@ -2678,6 +2931,217 @@ test("concurrent split reviews retain both receipts", async () => {
   const state = loadState(dataDir, "parallel");
   assert.equal(state.reviewPasses.length, 2);
   assert.ok(state.approval);
+});
+
+test("an aged lock held by a live child is never reclaimed", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "voltflow-live-lock-"));
+  const dataDir = mkdtempSync(path.join(tmpdir(), "voltflow-state-"));
+  const session = "live-lock";
+  const child = lockHolder(root, dataDir, session);
+  await child.ready;
+  const lock = lockPath(dataDir, session);
+  utimesSync(lock, new Date(0), new Date(0));
+
+  let entered = false;
+  try {
+    assert.throws(
+      () => runController(
+        ["start", "--session", session, "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+        { dataDir, cwd: root, fingerprint: () => { entered = true; return "second"; } },
+      ),
+      /timed out waiting for the VoltFlow session lock/,
+    );
+    assert.equal(entered, false);
+  } finally {
+    child.process.stdin.end("x");
+    await child.done;
+  }
+});
+
+test("stale lock recovery fails clearly when hard links are unavailable", async () => {
+  const source = readFileSync(new URL("../plugins/voltflow/scripts/voltflow.mjs", import.meta.url), "utf8")
+    .replace("  linkSync,\n", "  linkSync as nativeLinkSync,\n")
+    .replace('} from "node:fs";', '} from "node:fs";\nconst linkSync = () => { const error = new Error("hard links unavailable"); error.code = "EPERM"; throw error; };');
+  const { runController: portableController } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+  const fx = fixture();
+  const session = "portable-stale-lock";
+  const lock = lockPath(fx.dataDir, session);
+  const contents = JSON.stringify({ pid: 99999999, ownerId: "dead-owner" });
+  const recovery = `${lock}.${createHash("sha256").update(contents).digest("hex")}.recover`;
+  mkdirSync(path.dirname(lock), { recursive: true });
+  writeFileSync(lock, contents);
+  utimesSync(lock, new Date(0), new Date(0));
+
+  assert.throws(
+    () => portableController(
+      ["start", "--session", session, "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+      { ...fx.options, cwd: "/repo", fingerprint: () => "recovered" },
+    ),
+    (error) => error instanceof Error && error.message.includes(lock) && error.message.includes(recovery),
+  );
+});
+
+test("competing stale recovery cannot remove a recovered lock", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "voltflow-stale-race-"));
+  const dataDir = mkdtempSync(path.join(tmpdir(), "voltflow-state-"));
+  const session = "stale-race";
+  const lock = lockPath(dataDir, session);
+  mkdirSync(path.dirname(lock), { recursive: true });
+  writeFileSync(lock, JSON.stringify({ pid: 99999999, ownerId: "dead-owner" }));
+  utimesSync(lock, new Date(0), new Date(0));
+
+  const first = staleLockRecoverer(root, dataDir, session, "first");
+  const second = staleLockRecoverer(root, dataDir, session, "second");
+  try {
+    await Promise.race([
+      Promise.all([first.recoveryReady, second.recoveryReady]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("recoverers did not both validate the stale lock")), 250)),
+    ]);
+    first.recover();
+    await first.entered;
+    second.recover();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(second.didEnter(), false);
+
+    first.release();
+    await first.done;
+    await second.entered;
+  } finally {
+    first.release();
+    second.release();
+    await Promise.allSettled([first.done, second.done]);
+  }
+});
+
+test("an incompatible stale-recovery claimant fails closed", () => {
+  const fx = fixture();
+  const session = "dead-recovery-claim";
+  const lock = lockPath(fx.dataDir, session);
+  const contents = JSON.stringify({ pid: 99999999, ownerId: "dead-owner" });
+  const recovery = `${lock}.${createHash("sha256").update(contents).digest("hex")}.recover`;
+  mkdirSync(path.dirname(lock), { recursive: true });
+  writeFileSync(lock, contents);
+  writeFileSync(recovery, "99999999");
+  utimesSync(lock, new Date(0), new Date(0));
+  try {
+    assert.throws(
+      () => runController(
+        ["start", "--session", session, "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+        { ...fx.options, cwd: "/repo", fingerprint: () => "recovered" },
+      ),
+      /incompatible recovery claim/i,
+    );
+  } finally {
+    if (existsSync(recovery)) unlinkSync(recovery);
+  }
+});
+
+test("a persistent compatible stale-recovery claim fails closed", () => {
+  const fx = fixture();
+  const session = "persistent-recovery-claim";
+  const lock = lockPath(fx.dataDir, session);
+  const contents = JSON.stringify({ pid: 99999999, ownerId: "dead-owner" });
+  const recovery = `${lock}.${createHash("sha256").update(contents).digest("hex")}.recover`;
+  mkdirSync(path.dirname(lock), { recursive: true });
+  writeFileSync(lock, contents);
+  linkSync(lock, recovery);
+  utimesSync(lock, new Date(0), new Date(0));
+  try {
+    assert.throws(
+      () => runController(
+        ["start", "--session", session, "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+        { ...fx.options, cwd: "/repo", fingerprint: () => "recovered" },
+      ),
+      (error) => error instanceof Error && error.message.includes(recovery),
+    );
+  } finally {
+    if (existsSync(recovery)) unlinkSync(recovery);
+  }
+});
+
+test("an old finalizer cannot unlink a replacement lock generation", () => {
+  const fx = fixture();
+  const session = "replacement-lock";
+  const lock = lockPath(fx.dataDir, session);
+  try {
+    assert.equal(runController(
+      ["start", "--session", session, "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+      {
+        ...fx.options,
+        cwd: "/repo",
+        fingerprint: () => {
+          unlinkSync(lock);
+          writeFileSync(lock, JSON.stringify({ pid: process.pid, generation: "replacement" }));
+          return "replacement";
+        },
+      },
+    ).exitCode, 0);
+    assert.equal(existsSync(lock), true);
+  } finally {
+    if (existsSync(lock)) unlinkSync(lock);
+  }
+});
+
+test("a dead owner is recovered without deleting a replacement generation", () => {
+  const fx = fixture();
+  const session = "dead-lock";
+  const lock = lockPath(fx.dataDir, session);
+  mkdirSync(path.dirname(lock), { recursive: true });
+  writeFileSync(lock, JSON.stringify({ pid: 99999999, ownerId: "dead-owner" }));
+  utimesSync(lock, new Date(0), new Date(0));
+  let entered = false;
+  try {
+    assert.equal(runController(
+      ["start", "--session", session, "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+      {
+        ...fx.options,
+        cwd: "/repo",
+        fingerprint: () => {
+          entered = true;
+          unlinkSync(lock);
+          writeFileSync(lock, JSON.stringify({ pid: process.pid, ownerId: "replacement" }));
+          return "replacement";
+        },
+      },
+    ).exitCode, 0);
+    assert.equal(entered, true);
+    assert.equal(existsSync(lock), true);
+  } finally {
+    if (existsSync(lock)) unlinkSync(lock);
+  }
+});
+
+test("a claimed stale lock does not delete a replacement", () => {
+  const fx = fixture();
+  const session = "claimed-replacement-lock";
+  const lock = lockPath(fx.dataDir, session);
+  mkdirSync(path.dirname(lock), { recursive: true });
+  writeFileSync(lock, JSON.stringify({ pid: 99999999, ownerId: "dead-owner" }));
+  utimesSync(lock, new Date(0), new Date(0));
+  assert.throws(() => runController(
+    ["start", "--session", session, "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+    { ...fx.options, cwd: "/repo", afterStaleLockClaim: () => { unlinkSync(lock); writeFileSync(lock, JSON.stringify({ pid: process.pid, ownerId: "replacement" })); } },
+  ), /timed out waiting/);
+  assert.equal(JSON.parse(readFileSync(lock, "utf8")).ownerId, "replacement");
+  unlinkSync(lock);
+});
+
+test("stale empty, malformed, and legacy locks fail closed", () => {
+  const fx = fixture();
+  for (const contents of ["", "{", JSON.stringify({ ownerId: "legacy" })]) {
+    const session = `stale-lock-${contents.length}`;
+    const lock = lockPath(fx.dataDir, session);
+    mkdirSync(path.dirname(lock), { recursive: true });
+    writeFileSync(lock, contents);
+    utimesSync(lock, new Date(0), new Date(0));
+    assert.throws(
+      () => runController(
+        ["start", "--session", session, "--tier", "trivial", "--tdd", "exempt", "--review", "self"],
+        { ...fx.options, cwd: "/repo", fingerprint: () => "recovered" },
+      ),
+      /stale lock metadata/i,
+    );
+  }
 });
 
 test("compound and flagged deployment commands remain gated", () => {
@@ -3092,8 +3556,22 @@ test("invalid persisted state recovers and non-English prompts activate", () => 
   assert.match(output.hookSpecificOutput.additionalContext, /VoltFlow is active/);
 });
 
+test("the marketplace packages only VoltFlow runtime files", () => {
+  const root = realpathSync(new URL("..", import.meta.url));
+  const marketplace = JSON.parse(readFileSync(path.join(root, ".agents/plugins/marketplace.json"), "utf8"));
+  const source = marketplace.plugins.find((plugin) => plugin.name === "voltflow").source.path;
+
+  assert.equal(source, "./plugins/voltflow");
+  assert.deepEqual(readdirSync(path.resolve(root, source)).sort(), [
+    ".codex-plugin",
+    "hooks",
+    "scripts",
+    "skills",
+  ]);
+});
+
 test("Windows hooks fail visibly when Node is unavailable", () => {
-  const hooks = JSON.parse(readFileSync(new URL("../hooks/hooks.json", import.meta.url), "utf8"));
+  const hooks = JSON.parse(readFileSync(new URL("../plugins/voltflow/hooks/hooks.json", import.meta.url), "utf8"));
   for (const groups of Object.values(hooks.hooks)) {
     for (const group of groups) {
       for (const hook of group.hooks) {
@@ -3111,7 +3589,7 @@ function git(root, ...args) {
 
 function hookProcess(cwd, dataDir, payload) {
   return new Promise((resolve, reject) => {
-    const entry = new URL("../scripts/voltflow.mjs", import.meta.url);
+    const entry = new URL("../plugins/voltflow/scripts/voltflow.mjs", import.meta.url);
     const child = spawn(process.execPath, [entry.pathname, "hook"], {
       cwd,
       env: { ...process.env, PLUGIN_DATA: dataDir, PLUGIN_ROOT: path.dirname(path.dirname(entry.pathname)) },
@@ -3123,4 +3601,109 @@ function hookProcess(cwd, dataDir, payload) {
     child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr)));
     child.stdin.end(JSON.stringify(payload));
   });
+}
+
+function lockPath(dataDir, sessionId) {
+  const key = createHash("sha256").update(sessionId).digest("hex");
+  return path.join(dataDir, "sessions", `${key}.json.lock`);
+}
+
+function lockHolder(cwd, dataDir, session) {
+  const entry = new URL("../plugins/voltflow/scripts/voltflow.mjs", import.meta.url);
+  const source = [
+    'import { readSync } from "node:fs";',
+    `import { runController } from ${JSON.stringify(entry.href)};`,
+    "const input = Buffer.alloc(1);",
+    "const result = runController([\"start\", \"--session\", process.argv[1], \"--tier\", \"trivial\", \"--tdd\", \"exempt\", \"--review\", \"self\"], {",
+    "  dataDir: process.argv[2], cwd: process.cwd(),",
+    "  fingerprint: () => { process.stdout.write(\"ready\\n\"); readSync(0, input, 0, 1, null); return \"child\"; },",
+    "});",
+    "if (result.exitCode !== 0) { process.stderr.write(result.stderr); process.exitCode = result.exitCode; }",
+  ].join("\n");
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", source, session, dataDir], {
+    cwd,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stderr = "";
+  let stdout = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const ready = new Promise((resolve, reject) => {
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (stdout.includes("ready\n")) resolve();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => reject(new Error(`lock holder exited early (${code}): ${stderr}`)));
+  });
+  const done = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`lock holder failed (${code}): ${stderr}`)));
+  });
+  return { process: child, ready, done };
+}
+
+function staleLockRecoverer(cwd, dataDir, session, name) {
+  const entry = new URL("../plugins/voltflow/scripts/voltflow.mjs", import.meta.url);
+  const source = [
+    'import { readSync } from "node:fs";',
+    `import { runController } from ${JSON.stringify(entry.href)};`,
+    "const input = Buffer.alloc(1);",
+    "const result = runController([\"start\", \"--session\", process.argv[1], \"--tier\", \"trivial\", \"--tdd\", \"exempt\", \"--review\", \"self\"], {",
+    "  dataDir: process.argv[2], cwd: process.cwd(),",
+    "  beforeStaleLockRecovery: () => { process.stdout.write(\"recovery-ready\\n\"); readSync(0, input, 0, 1, null); },",
+    "  fingerprint: () => { process.stdout.write(\"entered\\n\"); readSync(0, input, 0, 1, null); return process.argv[3]; },",
+    "});",
+    "if (result.exitCode !== 0) { process.stderr.write(result.stderr); process.exitCode = result.exitCode; }",
+  ].join("\n");
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", source, session, dataDir, name], {
+    cwd,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stderr = "";
+  let stdout = "";
+  let entered = false;
+  let recoveryReady = false;
+  let released = false;
+  let resolveRecoveryReady;
+  let rejectRecoveryReady;
+  const recoveryBarrier = new Promise((resolve, reject) => {
+    resolveRecoveryReady = resolve;
+    rejectRecoveryReady = reject;
+  });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const enteredBarrier = new Promise((resolve, reject) => {
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (!recoveryReady && stdout.includes("recovery-ready\n")) {
+        recoveryReady = true;
+        resolveRecoveryReady();
+      }
+      if (!entered && stdout.includes("entered\n")) {
+        entered = true;
+        resolve();
+      }
+    });
+    child.on("error", reject);
+    child.on("close", (code) => reject(new Error(`stale recoverer exited early (${code}): ${stderr}`)));
+  });
+  const done = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (!recoveryReady) rejectRecoveryReady(new Error(`stale recoverer never reached recovery barrier (${code}): ${stderr}`));
+      code === 0 ? resolve() : reject(new Error(`stale recoverer failed (${code}): ${stderr}`));
+    });
+  });
+  return {
+    recoveryReady: recoveryBarrier,
+    entered: enteredBarrier,
+    didEnter: () => entered,
+    recover: () => child.stdin.write("r"),
+    release: () => {
+      if (!released) {
+        released = true;
+        child.stdin.end("x");
+      }
+    },
+    done,
+  };
 }

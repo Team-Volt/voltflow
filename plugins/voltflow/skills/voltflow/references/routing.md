@@ -7,8 +7,10 @@ Inspect the active spawn schema before delegating. Treat its model descriptions 
 | Task characteristics | Model tendency | Reasoning tendency |
 | --- | --- | --- |
 | Mechanical, read-heavy, repetitive, or easy to verify | Fastest capable model | Low or medium |
+| Bounded implementation with fast deterministic checks and a cost goal | `gpt-5.6-luna` when the active schema offers it | Max when the extra reasoning is cheaper than a stronger model route |
 | Bounded implementation with clear acceptance checks | Balanced coding model | Medium or high |
-| Ambiguous planning, difficult debugging, or cross-cutting integration | Strongest suitable model | High or xhigh |
+| External planning chosen after discovery | `gpt-5.6-sol` | At least the effort the plan's ambiguity and risk require |
+| Difficult debugging or cross-cutting integration | Strongest suitable model | High or xhigh |
 | Adversarial or holistic review | Capable reviewer, preferably configured differently from the author | Scale with ambiguity and the strength of deterministic checks |
 | Named high-risk boundary where a miss is expensive | Strongest suitable model | High or xhigh; max only under rule 5 |
 
@@ -18,7 +20,7 @@ Inspect the active spawn schema before delegating. Treat its model descriptions 
 2. The main session owns the selection. Set `model` and `reasoning_effort` directly when the spawn schema exposes them, and omit `service_tier` unless the user requests one.
 3. For independent review, prefer a model or reasoning configuration different from the author when available. Raise capability or effort only when the review scope, uncertainty, or named risk justifies it.
 4. Named high-risk boundaries include authorization, private data, payments, bookings, destructive or data-integrity migrations, and cross-cutting architecture. They establish a higher selection floor without prescribing one model family.
-5. Reserve `max` reasoning for security work, destructive or data-integrity risk, and genuinely deep cross-cutting architecture with high ambiguity. A `high` tier or adversarial review does not justify `max` by itself; ordinary high-tier implementation and review top out at `xhigh`.
+5. Reserve `max` reasoning for work that benefits from it. One valid cost route is Luna max for bounded implementation with strong deterministic checks. Do not infer fixed capability parity between Luna, Sol, or Terra from model names or anecdotes.
 6. Never select `ultra` reasoning for a subagent. If the user explicitly requests it, report the policy conflict instead of substituting another effort.
 7. Honor any other explicit user selection. If the requested model or effort is unavailable, report that instead of silently substituting or downgrading it.
 8. If only `agent_type` is available, select the closest matching profile whose effort is known and not `ultra`. If no override surface exists, inherit the parent only when its effort is known and not `ultra`; state `routing degraded` once in the result. If neither compliant route exists, refuse the spawn and state `routing blocked`.
@@ -29,8 +31,8 @@ Inspect the active spawn schema before delegating. Treat its model descriptions 
 
 Inspect the active tool schema before spawning and use only fields it declares.
 
-- Multi-agent v1: call `multi_agent_v1.spawn_agent` with `message`, `fork_context: false`, and the chosen `model` and `reasoning_effort`. Add `agent_type` only when a matching role improves the assignment.
-- Multi-agent v2: always call the flat `spawn_agent` with `task_name`, `message`, and `fork_turns: "none"`. Never use full-history inheritance. Pass model settings only when the schema declares them; otherwise use a verified non-ultra profile or parent and report `routing degraded`. Refuse the spawn when no compliant route exists.
+- Multi-agent v1: call `multi_agent_v1.spawn_agent` with `message`, the chosen `model` and `reasoning_effort`, and `fork_context` only as needed. Planning may inherit context; isolated work should not.
+- Multi-agent v2: call the flat `spawn_agent` with `task_name`, `message`, and the context needed for that assignment. Use `fork_turns: "10"` for an external planner when recent decisions matter and `"none"` for isolated work. Pass model settings only when the schema declares them; otherwise use a verified non-ultra profile or parent and report `routing degraded`.
 
 The hook workflow observes subagent lifecycle events rather than calling either API, so review collection does not depend on the spawn schema.
 
