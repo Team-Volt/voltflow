@@ -100,7 +100,7 @@ Complete this loop for every TDD-required slice:
 
 Before writing, name the owned paths and expected observable. Do not perform adjacent cleanup, introduce a dependency that the standard library or platform replaces, or add an abstraction with one foreseeable implementation.
 
-Record successful automated or manual validation with the controller. A passing command from before the final edit is stale evidence. Exercise every changed observable layer: a syntax check proves syntax, not browser behavior. When user-facing web files change, run one real browser path at a supported viewport, or report that claim as pending when no browser runtime is available.
+Directly executed passing test commands are recorded automatically. Use `validate` only for manual checks or when status shows that the hook could not capture automation. A passing command from before the final edit is stale evidence. Exercise every changed observable layer: a syntax check proves syntax, not browser behavior. When user-facing web files change, run one real browser path at a supported viewport, or report that claim as pending when no browser runtime is available.
 
 ## Delegate only useful parallel work
 
