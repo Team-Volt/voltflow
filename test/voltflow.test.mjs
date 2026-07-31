@@ -571,6 +571,63 @@ test("plain plan steps finish without a named outcome", () => {
   assert.equal(step.result, undefined);
 });
 
+test("plan spec revisions preserve completed plain steps across linked worktrees", () => {
+  const fx = worktreeFixture();
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Revise a parallel plan" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const spec = thoroughPlan({
+    goal: "Finish the parallel task",
+    steps: [
+      { id: "build", action: "Build it", dependsOn: [], lane: "code", stop: "Build passes" },
+      { id: "review", action: "Review it", dependsOn: ["build"], lane: "review", stop: "Review passes" },
+    ],
+  });
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(spec)],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--result", JSON.stringify({ id: "build", evidence: "Build passed" })],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+
+  const revised = thoroughPlan({
+    goal: "Finish the revised parallel task",
+    steps: [
+      { ...spec.steps[0], action: "Build the revised task" },
+      { ...spec.steps[1], action: "Review the revised task" },
+    ],
+  });
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(revised)],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  for (const cwd of [fx.root, fx.worker]) {
+    const plan = loadState(fx.dataDir, "session-1", cwd).plan;
+    assert.equal(plan.steps[0].status, "done");
+    assert.equal(plan.steps[0].evidence, "Build passed");
+    assert.deepEqual(JSON.parse(runController(
+      ["status", "--session", "session-1", "--workflow"],
+      { ...fx.options, cwd },
+    ).stdout).readySteps, ["review"]);
+  }
+
+  const incompatible = thoroughPlan({
+    ...revised,
+    steps: [{ ...revised.steps[0], outcomes: ["pass"] }, revised.steps[1]],
+  });
+  assert.equal(runController(
+    ["plan", "--session", "session-1", "--spec", JSON.stringify(incompatible)],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  const reset = loadState(fx.dataDir, "session-1", fx.root).plan.steps[0];
+  assert.equal(reset.status, undefined);
+  assert.equal(reset.evidence, undefined);
+});
+
 test("a worker binds to its worktree on first routed tool use", () => {
   const fx = worktreeFixture();
   handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
@@ -2215,6 +2272,14 @@ test("read-only searches can contain deployment command text", () => {
   assert.equal(isDeployInvocation("Bash", { command: "rtk rg 'terraform apply' scripts" }, fx.root), false);
   assert.equal(isDeployInvocation("Bash", { command: "rg 'npm run deploy' deploy.sh | sh" }, fx.root), true);
   assert.equal(isDeployInvocation("Bash", { command: "echo $(npm run deploy)" }, fx.root), true);
+});
+
+test("zsh execution substitutions cannot hide deployment commands", () => {
+  const fx = fixture();
+  assert.equal(isDeployInvocation("Bash", { command: "rg x =(npm publish)" }, fx.root), true);
+  assert.equal(isDeployInvocation("Bash", {
+    command: "node '/plugin/scripts/voltflow.mjs' plan --spec =(npm publish)",
+  }, fx.root), true);
 });
 
 test("controller plan commands can describe deployment work", () => {

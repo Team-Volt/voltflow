@@ -272,7 +272,19 @@ export function runController(argv, options = {}) {
         ...spec,
         steps: spec.steps.map((step) => {
           const existing = existingSteps.get(step.id);
-          if (existing?.result === undefined) return step;
+          if (existing?.result === undefined) {
+            if (
+              existing?.status === "done"
+              && step.status === undefined
+              && step.evidence === undefined
+              && step.outcomes === undefined
+              && step.repeat === undefined
+              && step.when === undefined
+            ) {
+              return { ...step, status: existing.status, evidence: existing.evidence };
+            }
+            return step;
+          }
           const revised = {
             ...step,
             evidence: existing.evidence,
@@ -1678,7 +1690,7 @@ function hasShellExecutionExpansion(segment) {
       quote = quote === '"' ? null : quote === null ? '"' : quote;
       continue;
     }
-    if (character === "`" || "<$>".includes(character) && segment[index + 1] === "(") return true;
+    if (character === "`" || "<$>=".includes(character) && segment[index + 1] === "(") return true;
   }
   return false;
 }
