@@ -33,9 +33,11 @@ function fixture() {
   };
 }
 
-function worktreeFixture() {
+function worktreeFixture({ nestedWorker = false } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "voltflow-main-"));
-  const worker = mkdtempSync(path.join(tmpdir(), "voltflow-worker-"));
+  const worker = nestedWorker
+    ? path.join(root, "worker")
+    : mkdtempSync(path.join(tmpdir(), "voltflow-worker-"));
   const dataDir = mkdtempSync(path.join(tmpdir(), "voltflow-state-"));
   git(root, "init", "-q");
   git(root, "config", "user.email", "qa@example.com");
@@ -487,6 +489,33 @@ test("workflow status shows ready plan steps and linked agent bindings", () => {
   assert.equal(workflow.worktrees.length, 2);
   assert.deepEqual(workflow.worktrees.find((entry) => entry.cwd === realpathSync(fx.worker)).agentIds, ["worker-1"]);
   assert.ok(workflow.worktrees.every((entry) => Array.isArray(entry.pending)));
+});
+
+test("workflow status omits a removed linked worktree", () => {
+  const fx = worktreeFixture({ nestedWorker: true });
+  handleHook(input("UserPromptSubmit", { cwd: fx.root, prompt: "Implement in parallel" }), fx.options);
+  assert.equal(runController(
+    ["start", "--session", "session-1", "--tier", "high", "--tdd", "required", "--review", "split"],
+    { ...fx.options, cwd: fx.root },
+  ).exitCode, 0);
+  assert.equal(runController(
+    ["status", "--session", "session-1"],
+    { ...fx.options, cwd: fx.worker },
+  ).exitCode, 0);
+  assert.equal(loadState(fx.dataDir, "session-1", fx.worker).cwd, realpathSync(fx.worker));
+
+  git(fx.root, "worktree", "remove", "--force", fx.worker);
+  mkdirSync(fx.worker);
+  writeFileSync(path.join(fx.worker, "unrelated.txt"), "unrelated\n");
+
+  const status = runController(
+    ["status", "--session", "session-1", "--workflow"],
+    { ...fx.options, cwd: fx.root },
+  );
+  assert.equal(status.exitCode, 0, status.stderr);
+  const workflow = JSON.parse(status.stdout);
+  assert.equal(workflow.worktrees.length, 1);
+  assert.ok(workflow.worktrees.every((entry) => entry.cwd !== realpathSync(fx.worker)));
 });
 
 test("high workflows may edit and review without a stored plan", () => {
@@ -2718,6 +2747,35 @@ test("desktop exec hooks route nested test RED to the command worktree", () => {
 
   assert.equal(loadState(fx.dataDir, "session-1", fx.root).red, null);
   assert.equal(loadState(fx.dataDir, "session-1", fx.worker).red.details, command);
+});
+
+test("modern Node Unicode failures in nested desktop output record RED", () => {
+  const fx = fixture();
+  handleHook(input("UserPromptSubmit", { prompt: "Implement queue behavior" }), fx.options);
+  start(fx);
+  const command = "node --test test/queue.test.mjs";
+  const hook = {
+    tool_name: "exec",
+    tool_input: `const r = await tools.exec_command(${JSON.stringify({ cmd: command })});\ntext(r.output);`,
+    tool_response: [
+      { type: "input_text", text: "Script completed\nOutput:\n" },
+      {
+        type: "input_text",
+        text: [
+          "✖ enqueue returns a new queue",
+          "ℹ tests 1",
+          "ℹ pass 0",
+          "ℹ fail 1",
+          "",
+          "✖ failing tests:",
+        ].join("\n"),
+      },
+    ],
+  };
+
+  handleHook(input("PostToolUse", hook), fx.options);
+
+  assert.match(loadState(fx.dataDir, "session-1").red.details, /node --test/);
 });
 
 test("a wrapper cannot create RED without test-runner output", () => {

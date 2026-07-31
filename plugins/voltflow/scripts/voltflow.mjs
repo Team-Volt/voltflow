@@ -996,6 +996,7 @@ function pendingReasons(state, currentFingerprint) {
 function workflowStatus(dataDir, sessionId, cwd, state, fingerprint) {
   const workflowId = state.workflowId ?? state.promptHash;
   const readiness = planReadiness(state.plan);
+  const registered = registeredWorktrees(cwd);
   return {
     workflowId,
     tier: state.tier,
@@ -1005,7 +1006,9 @@ function workflowStatus(dataDir, sessionId, cwd, state, fingerprint) {
     plan: state.plan,
     ...readiness,
     worktrees: loadSessionStates(dataDir, sessionId)
-      .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId && sameRepository(entry.cwd, cwd))
+      .filter((entry) => (entry.workflowId ?? entry.promptHash) === workflowId
+        && sameRepository(entry.cwd, cwd)
+        && (registered === null || registered.has(canonicalPath(entry.cwd))))
       .map((entry) => ({
         cwd: entry.cwd,
         agentIds: entry.agentIds ?? [],
@@ -1014,6 +1017,17 @@ function workflowStatus(dataDir, sessionId, cwd, state, fingerprint) {
         pending: pendingReasons(entry, fingerprint(entry.cwd)),
       })),
   };
+}
+
+function registeredWorktrees(cwd) {
+  const result = git(cwd, ["worktree", "list", "--porcelain"]);
+  if (!result.ok) return null;
+  return new Set(result.stdout.split(/\n\n+/).flatMap((block) => {
+    const lines = block.split("\n");
+    if (lines.some((line) => line.startsWith("prunable"))) return [];
+    const worktree = lines.find((line) => line.startsWith("worktree "));
+    return worktree === undefined ? [] : [canonicalPath(worktree.slice("worktree ".length))];
+  }));
 }
 
 function evidenceBlocker(state, currentFingerprint) {
@@ -1591,7 +1605,7 @@ function toolResponseText(response) {
 }
 
 function testOutputFailed(response) {
-  return /(?:^|\n)(?:not ok \d+\s+-|FAILED \([^\n)]*failures=[1-9]\d*|=+ .* [1-9]\d* failed|test result: FAILED|Tests:\s+.*[1-9]\d* failed|Tests run:.*Failures:\s*[1-9]\d*)/im.test(toolResponseText(response));
+  return /(?:^|\n)(?:not ok \d+\s+-|FAILED \([^\n)]*failures=[1-9]\d*|=+ .* [1-9]\d* failed|test result: FAILED|Tests:\s+.*[1-9]\d* failed|Tests run:.*Failures:\s*[1-9]\d*|ℹ\s+fail\s+[1-9]\d*)/im.test(toolResponseText(response));
 }
 
 function testSetupFailed(response) {
